@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.env
+
+# Jangan unggah rahasia/API key ke GitHub
+.streamlit/secrets.toml
+
+# Data lokal sementara
+*.log
+*.sqlite3
+.DS_Store

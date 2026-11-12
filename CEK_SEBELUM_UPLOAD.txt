@@ -1,0 +1,16 @@
+CHECKLIST SEBELUM UPLOAD KE GITHUB
+================================
+[ ] Repository GitHub: PRIVATE (untuk data PNM dan akses tim penelitian)
+[ ] Upload ISI folder, bukan file ZIP sebagai satu file
+[ ] streamlit_app.py berada di ROOT repository
+[ ] physics.py dan requirements.txt berada di ROOT
+[ ] data/pnm_b0_b50.csv ikut di-upload (10 baris, tanpa fuel consumption)
+[ ] .streamlit/config.toml ikut di-upload
+[ ] Jangan upload password, API key, .env, atau secrets.toml
+[ ] Streamlit Cloud: Create app → Repository → main → streamlit_app.py
+[ ] Python version: 3.12 (Advanced settings)
+[ ] Settings/Sharing: PRIVATE / Only specific people can view
+[ ] Invite email anggota tim peneliti, lalu uji akses dan simulasi
+
+Alamat dashboard ONLINE baru ada setelah deploy berhasil di Streamlit Cloud.
+Contoh format: https://nama-aplikasi.streamlit.app
