@@ -1,0 +1,14 @@
+TOYOTA 2KD-FTV ENGINE SIMULATOR V3 — LAPORAN PENGUJIAN
+Tanggal: 16 November 2026
+
+1. Pengujian model fisika V2 (tests/test_physics.py): 7 lulus
+2. Pengujian 4 mode V2 (tests/test_modes_v2.py): 5 lulus
+3. Pengujian varian V3 (tests/test_variants_v3.py): 7 lulus (dijalankan bertahap)
+4. Uji CSV PNM fallback (tests/test_pnm_fallback.py): 1 lulus
+5. UI smoke melalui Streamlit pengganti: 2WD dan 4WD, masing-masing 14 grafik lulus
+6. verifikasi_paket.py: lulus, termasuk dua titik rating
+
+Batasan: belum dites langsung pada Streamlit Community Cloud atau pada mesin/dynamometer
+aktual. Rating dan plateau nominal diperlakukan sebagai input pabrikan. Angka pada
+RPM lain dan boost adalah asumsi model. Varian PNM belum terkonfirmasi; data
+fuel consumption PNM tidak digunakan.
