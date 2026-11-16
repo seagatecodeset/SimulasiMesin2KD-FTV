@@ -1,4 +1,4 @@
-"""Model termodinamika 0D satu-zona, Toyota 2KD-FTV 2WD awal.
+"""Model termodinamika 0D satu-zona, Toyota 2KD-FTV 2WD / 4WD awal.
 
 Basis: Heywood, Internal Combustion Engine Fundamentals; adaptasi dari
 ppo_blend_physics.py milik pengguna (PPO starter, 28 September 2026).
@@ -8,8 +8,11 @@ ppo_blend_physics.py milik pengguna (PPO starter, 28 September 2026).
 - LHV default adalah ASUMSI, bukan 'calorific value' tabel yang belum diverifikasi.
 - Cetane *index* tabel sebagai PROXY CN eksploratif, bukan pengukuran CN.
 - Korelasi emisi hanya INDEKS RELATIF, bukan prediksi NOx ppm/FSN terukur.
-- Mode fixed_torque mencari massa bahan bakar, fixed_injection mempertahankan
-  massa bahan bakar B0 pada RPM + beban target yang sama.
+- Empat mode: fixed_torque; fixed_injection (sama dengan B0 per RPM);
+  fixed_mass_cycle (massa mg/siklus/silinder konstan); fixed_fuel_flow
+  (laju massa kg/jam konstan). Definisi dan batas model dijelaskan di UI.
+- RPM > 2250 berasal dari asumsi model & spesifikasi pabrikan; BUKAN
+  ekstrapolasi data performa PNM yang hanya tersedia hingga 2250 rpm.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -17,7 +20,7 @@ from functools import lru_cache
 import math
 import numpy as np
 
-# 2KD-FTV 2WD awal, referensi 65 kW @ 3800; 192 Nm @ 1200..3000 rpm.
+# 2KD-FTV 2WD/4WD awal: spesifikasi berbeda untuk rated power dan torsi.
 N_CYL = 4
 BORE_M = 0.092
 STROKE_M = 0.0938
@@ -39,15 +42,50 @@ REFERENCE_FUELS = {
 }
 
 @dataclass(frozen=True)
+class EngineProfile:
+    key: str
+    label: str
+    rated_power_kw: float
+    rated_rpm: int
+    max_torque_nm: float
+    torque_plateau_start_rpm: int
+    torque_plateau_end_rpm: int
+    torque_1000_nm: float  # ASUMSI — bentuk envelope, bukan titik pengukuran
+    torque_3800_nm: float | None  # ASUMSI di atas rated rpm khusus 4WD
+    boost_pr_max_assumed: float  # ASUMSI surrogate turbo, bukan ECU/turbo map
+
+
+# Angka rating/plateau: Toyota, New Features – 2KD-FTV Engine, hal. 19.
+# Endpoint 1000 rpm dan 3800 rpm (4WD), bentuk interpolasi dan boost adalah
+# ASUMSI pemodelan agar kurva dapat dihitung; bukan data pabrikan per RPM.
+ENGINE_PROFILES: dict[str, EngineProfile] = {
+    '2wd': EngineProfile('2wd', '2WD awal', 65.0, 3800, 192.0,
+                         1200, 3000, 165.0, None, 1.65),
+    '4wd': EngineProfile('4wd', '4WD awal (High Version)', 75.0, 3600, 260.0,
+                         1600, 2400, 195.0, 178.0, 1.80),
+}
+
+
+def get_engine_profile(variant: str = '2wd') -> EngineProfile:
+    try:
+        return ENGINE_PROFILES[variant]
+    except KeyError as exc:
+        raise ValueError(f"Varian mesin tidak dikenal: {variant!r}; pilihan 2wd atau 4wd") from exc
+
+
+@dataclass(frozen=True)
 class Settings:
+    variant: str = "2wd"
     rpm: int = 2000
     load_pct: float = 50.0
     b_pct: float = 50.0
-    mode: str = "fixed_torque"  # fixed_torque | fixed_injection
+    mode: str = "fixed_torque"  # fixed_torque | fixed_injection | fixed_mass_cycle | fixed_fuel_flow
+    fixed_mg_cycle_cyl: float = 30.0  # mg/injection-cycle/cylinder, BOTH fuels, all RPM
+    fixed_fuel_kg_h: float = 9.0      # kg/h total engine, BOTH fuels, all RPM
     lhv_b0: float = 43.0   # ASUMSI sementara MJ/kg
     lhv_b100: float = 40.0 # ASUMSI sementara MJ/kg
     cn_override: float | None = None
-    pressure_ratio_max: float = 1.65  # ASUMSI conventional turbo
+    pressure_ratio_max: float | None = None  # None -> default ASUMSI spesifik profil 2WD/4WD
     intake_temp_k: float = 305.0      # K
     soi_deg: float = -6.0             # SOI main, ASUMSI (°CA ATDC)
     pilot_enabled: bool = True        # strategi pilot ASSUMSI, verifikasi ECU
@@ -147,14 +185,31 @@ def geometry():
     return v, area
 
 
-def full_load_torque(rpm: float) -> float:
-    """Profil envelope ASUMSI: 192 Nm @1200..3000, 65 kW @3800."""
-    t3800 = 65000 * 60 / (2*math.pi*3800)
-    if rpm < 1200:
-        return float(np.interp(rpm,[1000,1200],[165,192]))
-    if rpm <= 3000:
-        return 192.0
-    return float(np.interp(rpm,[3000,3800],[192,t3800]))
+def full_load_torque(rpm: float, variant: str = '2wd') -> float:
+    """Envelope nominal INTERPOLASI, bukan hasil uji torsi per titik RPM.
+
+    Anchors terverifikasi: rating daya, torsi maksimum, dan rentang plateau.
+    2WD: 192 Nm @ 1200–3000; 65 kW @ 3800.
+    4WD: 260 Nm @ 1600–2400; 75 kW @ 3600.
+    Pada 4WD 3600–3800, endpoint 178 Nm adalah asumsi dan DILABELI
+    di atas RPM rated; model hanya eksploratif di area itu.
+    """
+    profile = get_engine_profile(variant)
+    n = float(rpm)
+    t_rated = profile.rated_power_kw * 1000 * 60 / (2 * math.pi * profile.rated_rpm)
+    if n < profile.torque_plateau_start_rpm:
+        return float(np.interp(n, [1000, profile.torque_plateau_start_rpm],
+                               [profile.torque_1000_nm, profile.max_torque_nm]))
+    if n <= profile.torque_plateau_end_rpm:
+        return profile.max_torque_nm
+    if n <= profile.rated_rpm:
+        return float(np.interp(n, [profile.torque_plateau_end_rpm, profile.rated_rpm],
+                               [profile.max_torque_nm, t_rated]))
+    if profile.torque_3800_nm is not None:
+        return float(np.interp(n, [profile.rated_rpm, 3800],
+                               [t_rated, profile.torque_3800_nm]))
+    # 2WD: di atas rated tidak digunakan oleh sweep default.
+    return t_rated
 
 
 def cv(T):
@@ -189,12 +244,17 @@ def simulate_cycle(settings: Settings, b_pct: float, rpm: float, m_f_fixed: floa
     else:
         prop = fuel_properties(b_pct, settings.lhv_b0, settings.lhv_b100,
                                settings.cn_override if b_pct != 0 else None)
+    profile = get_engine_profile(settings.variant)
     n = float(rpm)
-    t_target = full_load_torque(n) * settings.load_pct/100
+    t_target = full_load_torque(n, settings.variant) * settings.load_pct/100
     bmep_target = 4*math.pi*t_target/V_TOTAL/1e5
     load = settings.load_pct/100.
     # Conventional turbo dengan map PR surrogate, bukan compressor map terukur.
-    PR = 1+(settings.pressure_ratio_max-1)*load**1.2*(n/3800)**.6
+    pr_max = (settings.pressure_ratio_max if settings.pressure_ratio_max is not None
+              else profile.boost_pr_max_assumed)
+    if not 1 <= pr_max <= 2.5:
+        raise ValueError('Rasio tekanan turbo maksimum harus antara 1 dan 2,5.')
+    PR = 1+(pr_max-1)*load**1.2*min(n/profile.rated_rpm,1.0)**.6
     T2 = settings.intake_temp_k*(1+(PR**.286-1)/.7)
     p_ivc = .98*PR*1e5
     T_ivc = T2+15+20*load
@@ -257,6 +317,7 @@ def simulate_cycle(settings: Settings, b_pct: float, rpm: float, m_f_fixed: floa
         residual_pct=abs(Qtotal-W-Qwall-delta_u)/max(Qtotal,1e-8)*100
         return locals()
 
+    requested_mf = m_f_fixed
     if m_f_fixed is None:
         lower = 1e-7
         upper = max_fuel
@@ -296,9 +357,14 @@ def simulate_cycle(settings: Settings, b_pct: float, rpm: float, m_f_fixed: floa
     soot_raw=1.9*max(r['phi'],0)**2.5*(1-r['beta'])*max(1-prop['O_pct']/30,.05)*(prop['viscosity_cst']/3)**.25
     ca50 = float(THETA[np.argmax(r['xb']>=0.5)]) if np.any(r['xb']>=0.5) else None
     result={
+        'variant':settings.variant, 'engine_profile':profile.label,
         'rpm':int(n), 'fuel_pct':float(b_pct),'torque_nm':float(torque),'power_kw':float(power_kw),
         'bmep_bar':float(bmep),'target_bmep_bar':float(bmep_target),'imep_bar':float(r['imep']),
         'fmep_bar':float(r['fmep']),'fuel_kg_h':float(fuel_kg_h), 'fuel_mg_cycle_cyl':float(mf*1e6),
+        'requested_fuel_mg_cycle_cyl':float(requested_mf*1e6) if requested_mf is not None else None,
+        'air_fuel_limit_mg_cycle_cyl':float(max_fuel*1e6),
+        'requested_fuel_kg_h':float(requested_mf*N_CYL*n/120*3600) if requested_mf is not None else None,
+        'fuel_capped_by_air':bool(capped) if requested_mf is not None else bool(capped),
         'bsfc_g_kwh':float(bsfc) if bsfc is not None else None,
         'bte_pct':float(100*bte) if bte is not None else None,
         'lambda_air':float(lam),'phi':float(r['phi']),
@@ -307,6 +373,7 @@ def simulate_cycle(settings: Settings, b_pct: float, rpm: float, m_f_fixed: floa
         'nox_raw':nox_raw,'smoke_raw':float(soot_raw),
         'co2_ideal_kg_h':float(fuel_kg_h*prop['C_pct']/100*44/12),
         'energy_residual_pct':float(r['residual_pct']),
+        'turbo_pr_assumed':float(PR), 'turbo_pr_max_setting':float(pr_max),
         'fuel_lhv_mj_kg':float(prop['lhv_mj_kg']),
         'fuel_density_kg_m3':float(prop['density_kg_m3']),
         'fuel_viscosity_cst':float(prop['viscosity_cst']),
@@ -324,22 +391,57 @@ def simulate_cycle(settings: Settings, b_pct: float, rpm: float, m_f_fixed: floa
 
 
 def run_sweep(settings: Settings) -> dict:
-    if settings.mode not in ('fixed_torque','fixed_injection'):
+    profile = get_engine_profile(settings.variant)
+    if settings.mode not in ('fixed_torque','fixed_injection','fixed_mass_cycle','fixed_fuel_flow'):
         raise ValueError('mode tidak dikenal')
+    if settings.mode=='fixed_mass_cycle' and not (0 < settings.fixed_mg_cycle_cyl <= 100):
+        raise ValueError('Injeksi konstan harus 0 < mg/siklus/silinder <= 100')
+    if settings.mode=='fixed_fuel_flow' and not (0 < settings.fixed_fuel_kg_h <= 100):
+        raise ValueError('Laju bahan bakar konstan harus 0 < kg/jam <= 100')
     if settings.fuel_scheme not in ('biodiesel','ppo'):
         raise ValueError('Jenis campuran tidak dikenal')
     if settings.fuel_scheme=='ppo' and settings.ppo_pct+settings.b50_pct>100:
         raise ValueError('PPO + B50 tidak boleh lebih dari 100%.')
-    speeds=sorted({1250,1500,1750,2000,2250,settings.rpm})
+    # Titik PNM (<=2250) + titik tambahan sampai rating pabrikan 3800.
+    # Titik di atas 2250 belum tervalidasi oleh dataset PNM.
+    speeds=sorted({1250,1500,1750,2000,2250,2500,2750,3000,3250,3400,3600,3800,
+                   profile.torque_plateau_start_rpm, profile.torque_plateau_end_rpm,
+                   profile.rated_rpm, settings.rpm})
     points=[]
     focus={}
     for rpm in speeds:
-        # Referensi pada beban yang sama; untuk mode fixed_injection
-        # skenario memakai jumlah bahan bakar B0, bukan torsi tetap.
-        reference=simulate_cycle(settings,0,rpm)
-        scenario=simulate_cycle(settings,settings.b_pct,rpm,
+        # Definisi mode sengaja berbeda agar grafik fisik tidak salah ditafsirkan:
+        # fixed_torque: B0 dan skenario mencari m_f berbeda untuk T target.
+        # fixed_injection: B0 dicari pada T target per RPM, skenario pakai
+        #                  massa B0 pada RPM itu (masih BERUBAH antarputaran).
+        # fixed_mass_cycle: kedua bahan bakar menerima mg/cycle/cyl konstan.
+        # fixed_fuel_flow: kedua bahan bakar menerima kg/h konstan;
+        #                  mg/cycle/cyl turun ketika RPM naik.
+        if settings.mode=='fixed_mass_cycle':
+            mf_spec=settings.fixed_mg_cycle_cyl*1e-6
+            reference=simulate_cycle(settings,0,rpm,m_f_fixed=mf_spec)
+            scenario=simulate_cycle(settings,settings.b_pct,rpm,m_f_fixed=mf_spec,
+                                    recipe=settings.fuel_scheme=='ppo')
+        elif settings.mode=='fixed_fuel_flow':
+            mf_spec=settings.fixed_fuel_kg_h/3600/(N_CYL*rpm/120)
+            reference=simulate_cycle(settings,0,rpm,m_f_fixed=mf_spec)
+            scenario=simulate_cycle(settings,settings.b_pct,rpm,m_f_fixed=mf_spec,
+                                    recipe=settings.fuel_scheme=='ppo')
+        else:
+            reference=simulate_cycle(settings,0,rpm)
+            scenario=simulate_cycle(settings,settings.b_pct,rpm,
                                 m_f_fixed=reference['fuel_mg_cycle_cyl']/1e6 if settings.mode=='fixed_injection' else None,
                                 recipe=settings.fuel_scheme=='ppo')
+        # Rating nameplate adalah TITIK ACUAN bukan validasi hasil fisika.
+        rated_torque=full_load_torque(rpm,settings.variant)
+        for output in (reference, scenario):
+            output['rated_torque_nm']=rated_torque
+            output['rated_power_kw']=rated_torque*2*math.pi*rpm/(60*1000)
+            output['nominal_load_torque_nm']=rated_torque*settings.load_pct/100
+            output['above_rated_torque']=output['torque_nm']>rated_torque*1.02
+            output['outside_pnm_rpm']=rpm>2250
+            output['above_rated_rpm']=rpm>profile.rated_rpm
+            output['pnm_variant_verified']=False
         reference['series']='B0 REFERENSI'
         scenario['series']=(f'PPO{settings.ppo_pct:g}+Dex{100-settings.ppo_pct-settings.b50_pct:g}+B50_{settings.b50_pct:g} SKENARIO'
                             if settings.fuel_scheme=='ppo' else f'B{settings.b_pct:g} SKENARIO')
@@ -352,4 +454,6 @@ def run_sweep(settings: Settings) -> dict:
             points.append(p)
         if rpm==settings.rpm:
             focus={'reference':reference,'scenario':scenario}
-    return {'settings':settings,'points':points,'focus':focus,'rpm_grid':speeds}
+    return {'settings':settings,'profile':profile,'points':points,'focus':focus,
+            'rpm_grid':speeds,'pnm_rpm_max':2250,
+            'rated_power_kw':profile.rated_power_kw,'rated_rpm':profile.rated_rpm}
