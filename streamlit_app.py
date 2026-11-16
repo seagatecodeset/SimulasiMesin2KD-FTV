@@ -1,4 +1,4 @@
-"""Streamlit Cloud Toyota 2KD-FTV 2WD awal | Simulator 0-D non-ML.
+"""Streamlit Cloud Toyota 2KD-FTV 2WD/4WD awal | Simulator 0-D non-ML.
 
 App ini tidak membaca kolom fuel consumption dataset PNM.
 Data PNM berasal dari uji yang belum dikonfirmasi kesetaraan bebannya.
@@ -16,11 +16,20 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from physics import Settings, REFERENCE_FUELS, V_TOTAL, CR, BORE_M, STROKE_M, run_sweep
+from physics import (Settings, REFERENCE_FUELS, V_TOTAL, CR, BORE_M, STROKE_M,
+                     ENGINE_PROFILES, get_engine_profile, full_load_torque, run_sweep)
 
 ROOT = Path(__file__).resolve().parent
 PNM_PATH = ROOT / "data" / "pnm_b0_b50.csv"
 COLORS = {"B0": "#2563EB", "scenario": "#F97316", "pnmB0": "#2563EB", "pnmB50": "#0D9488"}
+
+PNM_COLUMNS = [
+    "fuel", "rpm", "torque_nm", "power_kw", "o2_pct", "co_ppm",
+    "nox_ppm", "no_ppm", "no2_ppm", "co2_pct", "hc_ppm", "smoke_pct"
+]
+# Salinan data eksperimen yang sudah dipilih, TANPA fuel consumption PNM.
+# Dipakai sebagai cadangan jika subfolder data/ belum tersalin ke GitHub.
+PNM_FALLBACK_CSV = 'fuel,rpm,torque_nm,power_kw,o2_pct,co_ppm,nox_ppm,no_ppm,no2_ppm,co2_pct,hc_ppm,smoke_pct\nB0,1250,78.2830769,10.20917,12.1388889,291.8888889,318.2555556,276.7777778,42.7333333,8.8877778,322.6666667,2.69\nB0,1500,84.3895238,13.031369,11.48,214.5555556,349.7222222,310.3333333,39.6333333,9.36,203.4444444,3.18\nB0,1750,95.7559172,17.5630769,11.3888889,152.5555556,365.6555556,333.1111111,31.2555556,9.8011111,69.2222222,5.27\nB0,2000,96.2319412,20.1330588,11.3855556,128.5555556,332.8555556,318.0,15.4,9.6666667,127.8888889,4.46\nB0,2250,90.0845294,21.2278235,11.6811111,111.3333333,322.2444444,299.5555556,22.5333333,9.3744444,172.5555556,3.0\nB50,1250,75.1023952,10.0808383,12.3822222,318.1111111,321.7555556,273.5555556,49.0222222,8.7133333,116.1111111,3.02\nB50,1500,80.7427219,12.7134911,11.8944444,222.6666667,336.6222222,299.6666667,43.3777778,9.5077778,49.7777778,4.9\nB50,1750,96.3649133,17.6910983,10.7344444,176.8888889,383.6222222,363.1111111,29.6333333,10.4522222,190.2222222,3.59\nB50,2000,96.8346154,20.5504734,11.2733333,127.6666667,352.7777778,328.0,26.9,10.0333333,88.4444444,4.49\nB50,2250,93.9657396,22.1574556,11.6322222,112.6666667,346.9777778,328.1111111,21.2555556,9.5177778,161.1111111,2.72\n'
 
 st.set_page_config(page_title="2KD-FTV Engine Lab | Online Simulator", page_icon="⚙️",
                    layout="wide", initial_sidebar_state="expanded")
@@ -47,12 +56,25 @@ st.markdown("""
 
 @st.cache_data(show_spinner=False)
 def load_pnm():
-    df = pd.read_csv(PNM_PATH)
-    # Daftar putih kolom; fuel consumption PNM sengaja dikecualikan seluruhnya.
-    allowed = ["fuel", "rpm", "torque_nm", "power_kw", "o2_pct", "co_ppm",
-               "nox_ppm", "no_ppm", "no2_ppm", "co2_pct", "hc_ppm", "smoke_pct"]
-    assert set(df.columns).issubset(set(allowed)), "Kolom di CSV PNM tidak sesuai daftar putih."
-    return df[allowed].copy()
+    """Membaca PNM dengan aman; simulator tidak berhenti jika berkas CSV belum di-upload.
+
+    Hanya kolom yang diizinkan yang diteruskan ke dashboard. Data konsumsi PNM
+    sengaja tidak dibaca, ditampilkan, atau dipakai dalam perhitungan.
+    """
+    try:
+        if not PNM_PATH.is_file():
+            raise FileNotFoundError(str(PNM_PATH))
+        df = pd.read_csv(PNM_PATH)
+        if not set(PNM_COLUMNS).issubset(df.columns):
+            raise ValueError("Kolom CSV PNM tidak lengkap")
+        df = df.loc[:, PNM_COLUMNS].copy()
+        if df.empty:
+            raise ValueError("CSV PNM kosong")
+        return df, "file GitHub"
+    except (OSError, ValueError, pd.errors.ParserError):
+        # Ini salinan data hasil audit PNM yang sama, bukan dataset sintetis.
+        fallback = pd.read_csv(io.StringIO(PNM_FALLBACK_CSV))
+        return fallback.loc[:, PNM_COLUMNS].copy(), "salinan tertanam (fallback)"
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=12)
 def model(settings: Settings):
@@ -60,18 +82,60 @@ def model(settings: Settings):
     return run_sweep(settings)
 
 
-def line_chart(df, y, title, axis_label, percent=False):
+def line_chart(df, y, title, axis_label, percent=False, nominal=False, profile=None):
     fig = go.Figure()
     for series, group in df.groupby("series", sort=False):
         c = COLORS["B0"] if series == "B0 REFERENSI" else COLORS["scenario"]
         fig.add_trace(go.Scatter(x=group["rpm"],y=group[y], mode="lines+markers",
                                  name=series, line=dict(color=c,width=3), marker=dict(size=7),
                                  hovertemplate="RPM %{x}<br>Nilai %{y:.3f}<extra>%{fullData.name}</extra>"))
+    # Referensi pabrikan: titik spesifikasi + envelope interpolasi sederhana.
+    # Bukan titik uji Toyota pada setiap RPM.
+    if nominal and y in ("torque_nm", "power_kw"):
+        if profile is None:
+            raise ValueError('Profil mesin wajib diberikan untuk grafik nominal.')
+        unique=df.drop_duplicates("rpm").sort_values("rpm")
+        nominal_col="rated_torque_nm" if y=="torque_nm" else "rated_power_kw"
+        fig.add_trace(go.Scatter(x=unique["rpm"],y=unique[nominal_col],mode="lines",
+                       name=f"Envelope {profile.label} — interpolasi asumsi (100% load)",
+                       line=dict(color="#64748B",dash="dash",width=1.8)))
+        if y=="power_kw":
+            rating = f"{profile.rated_power_kw:g} kW @ {profile.rated_rpm:,} rpm"
+            fig.add_trace(go.Scatter(x=[profile.rated_rpm],y=[profile.rated_power_kw],
+                mode="markers+text",name=f"Rating Toyota {rating}",text=[rating],
+                textposition="top left",marker=dict(size=10,symbol="diamond",color="#0F766E")))
+    fig.add_vrect(x0=2250,x1=3850,fillcolor="#F59E0B",opacity=.055,line_width=0)
+    if profile is not None and profile.rated_rpm < 3800:
+        fig.add_vrect(x0=profile.rated_rpm,x1=3850,fillcolor="#DC2626",opacity=.065,line_width=0)
     fig.update_layout(title=title, xaxis_title="RPM",yaxis_title=axis_label,
                       legend=dict(orientation="h",y=-.30,x=0),margin=dict(l=30,r=10,t=55,b=75),height=355,
                       hovermode="x unified")
     if percent:
         fig.update_yaxes(ticksuffix="%")
+    return fig
+
+
+def variant_nominal_chart(field: str):
+    """Komparasi envelope 2WD/4WD; hanya titik spesifikasi yang terverifikasi."""
+    fig = go.Figure()
+    speeds = list(range(1000,3801,100))
+    for variant,color in (("2wd", "#2563EB"), ("4wd", "#EA580C")):
+        profile = get_engine_profile(variant)
+        t = [full_load_torque(n,variant) for n in speeds]
+        values = (t if field == "torque_nm" else
+                  [val*2*math.pi*n/60000 for val,n in zip(t,speeds)])
+        fig.add_trace(go.Scatter(x=speeds,y=values,mode="lines",
+            name=f"{profile.label} (envelope asumsi)",line=dict(color=color,width=2.6)))
+        if field == "power_kw":
+            fig.add_trace(go.Scatter(x=[profile.rated_rpm],y=[profile.rated_power_kw],
+                mode="markers",name=f"Rating {profile.label}: {profile.rated_power_kw:g} kW @ {profile.rated_rpm}",
+                marker=dict(color=color,size=10,symbol="diamond")))
+    fig.add_vrect(x0=2250,x1=3850,fillcolor="#F59E0B",opacity=.05,line_width=0)
+    fig.update_layout(title=("Perbandingan kurva nominal torsi — 2WD vs 4WD" if field=="torque_nm"
+                             else "Perbandingan kurva nominal daya — 2WD vs 4WD"),
+        xaxis_title="RPM",yaxis_title=("Torsi (Nm)" if field=="torque_nm" else "Daya (kW)"),
+        height=350,hovermode="x unified",margin=dict(l=25,r=10,t=50,b=78),
+        legend=dict(orientation="h",y=-.31,x=0))
     return fig
 
 
@@ -102,11 +166,15 @@ def experiment_chart(pnm, variable, label):
 
 
 def clean_df(results):
-    keys = ["rpm","series","fuel_pct","torque_nm","power_kw","bmep_bar",
+    keys = ["variant","engine_profile","rpm","series","fuel_pct","torque_nm","power_kw","bmep_bar",
             "imep_bar","fmep_bar","bsfc_g_kwh","bte_pct","fuel_kg_h",
             "fuel_mg_cycle_cyl","lambda_air","pmax_bar","soc_deg","ca50_deg",
             "ign_delay_deg","nox_rel_pct","smoke_rel_pct","co2_ideal_kg_h",
-            "energy_residual_pct","limited"]
+            "energy_residual_pct","limited","rated_torque_nm","rated_power_kw",
+            "nominal_load_torque_nm","requested_fuel_mg_cycle_cyl",
+            "air_fuel_limit_mg_cycle_cyl","requested_fuel_kg_h",
+            "fuel_capped_by_air","above_rated_torque","outside_pnm_rpm",
+            "above_rated_rpm","pnm_variant_verified","turbo_pr_assumed","turbo_pr_max_setting"]
     return pd.DataFrame([{k: p.get(k) for k in keys} for p in results["points"]])
 
 
@@ -121,15 +189,43 @@ def fmt(v, unit="", decimals=2):
 
 # ================ CONTROLS ================
 st.sidebar.title("⚙️ Kendali Simulasi")
-st.sidebar.caption("Atur parameter lalu tekan Jalankan simulasi")
-st.sidebar.caption("2KD-FTV 2WD awal · 2.494 cc · CR 18,5:1")
+st.sidebar.caption("Toyota 2KD-FTV · 2.494 cc · CR 18,5:1 · **V3**")
+variant_labels = {"2WD awal · 65 kW": "2wd", "4WD awal · 75 kW": "4wd"}
+variant_label = st.sidebar.selectbox("Engine Variant", list(variant_labels),
+                                     index=0, key="engine_variant_choice",
+                                     help="Profil mesin mengikuti rating Toyota yang berbeda, bukan sekadar label penggerak roda.")
+variant = variant_labels[variant_label]
+selected_profile = get_engine_profile(variant)
+st.sidebar.caption(f"**{selected_profile.rated_power_kw:g} kW @ {selected_profile.rated_rpm:,} rpm** · "
+                   f"**{selected_profile.max_torque_nm:g} Nm @ "
+                   f"{selected_profile.torque_plateau_start_rpm:,}–{selected_profile.torque_plateau_end_rpm:,} rpm**")
+st.sidebar.caption("Atur input dan tekan Jalankan simulasi. Mengganti varian langsung memperbarui hasil.")
 with st.sidebar.form("simulation_input"):
     rpm=st.number_input("Putaran mesin (rpm)",min_value=1000,max_value=3800,value=2000,step=50)
     load=st.slider("Beban relatif terhadap torsi referensi (%)", min_value=10,max_value=100,value=50,step=5,
-                   help="Beban 100% mengacu pada envelope torsi teoritis varian 2WD awal, bukan data ECU.")
-    mode_label=st.radio("Mode simulasi",options=["Torsi target tetap","Jumlah injeksi tetap"],
-                        help="Mode injeksi tetap menahan jumlah bahan bakar B0 pada RPM dan beban referensi.")
-    mode="fixed_torque" if mode_label=="Torsi target tetap" else "fixed_injection"
+                   help="Beban 100% mengacu pada envelope torsi profil 2WD/4WD yang dipilih, bukan data ECU aktual.")
+    mode_options={
+       "Torsi target per RPM (default)":"fixed_torque",
+       "Injeksi skenario = B0 pada masing-masing RPM":"fixed_injection",
+       "Massa injeksi konstan pada seluruh RPM (mg/siklus/silinder)":"fixed_mass_cycle",
+       "Laju aliran bahan bakar konstan pada seluruh RPM (kg/jam)":"fixed_fuel_flow",
+    }
+    mode_label=st.selectbox("Mode pengendalian bahan bakar",list(mode_options),index=0)
+    mode=mode_options[mode_label]
+    fixed_mg=30.0
+    fixed_flow=6.0
+    if mode=="fixed_mass_cycle":
+        fixed_mg=st.number_input("Massa injeksi TETAP (mg/siklus/silinder)",
+                       min_value=2.0,max_value=100.0,value=30.0,step=1.0)
+        st.caption("Jumlah mg/siklus/silinder sama untuk B0, skenario, dan semua RPM; kg/jam meningkat sebanding RPM bila tidak dibatasi udara.")
+    elif mode=="fixed_fuel_flow":
+        fixed_flow=st.number_input("Laju massa bahan bakar TETAP (kg/jam total mesin)",
+                       min_value=0.5,max_value=100.0,value=6.0,step=0.5)
+        st.caption("Laju kg/jam sama untuk B0, skenario, dan semua RPM; mg/siklus menurun saat RPM meningkat bila tidak dibatasi udara.")
+    elif mode=="fixed_injection":
+        st.caption("B0 diselesaikan untuk torsi target di setiap RPM. Massa skenario disamakan dengan massa B0 PADA RPM ITU; nilainya berbeda antar-RPM.")
+    else:
+        st.caption("Target torsi mengikuti persentase kurva nominal yang diasumsikan. Model mengiterasi kebutuhan bahan bakar untuk mencapai torsi tersebut.")
     blend_mode=st.radio("Jenis campuran",["Biodiesel B0–B100","PPO-M + Dex + B50 (ilustratif)"],index=0)
     b_pct=50.0
     ppo_pct=0.0
@@ -149,14 +245,17 @@ with st.sidebar.form("simulation_input"):
         cn=st.number_input("CN skenario",min_value=25.0,max_value=90.0,value=55.0,step=1.0,
                            disabled=not cn_user)
         prmax=st.number_input("Rasio tekanan turbo maksimum (asumsi)",min_value=1.0,
-                              max_value=2.2,value=1.65,step=.05)
+                              max_value=2.2,value=selected_profile.boost_pr_max_assumed,
+                              step=.05,key=f"boost_pr_{variant}",
+                              help="Nilai 2WD dan 4WD merupakan asumsi model, bukan compressor map/hasil ECU.")
         intake_c=st.number_input("Temperatur udara masuk lingkungan (°C)",min_value=10,max_value=55,value=32,step=1)
         soi=st.number_input("Main SOI pada beban 100% (°CA ATDC)",min_value=-25.0,
                              max_value=10.0,value=-6.0,step=1.0)
         pilot=st.checkbox("Aktifkan koreksi pilot injection (asumsi)",value=True)
     submitted=st.form_submit_button("▶ Jalankan simulasi",type="primary",use_container_width=True)
 
-settings=Settings(rpm=int(rpm),load_pct=float(load),b_pct=b_pct,mode=mode,
+settings=Settings(variant=variant,rpm=int(rpm),load_pct=float(load),b_pct=b_pct,mode=mode,
+                  fixed_mg_cycle_cyl=float(fixed_mg),fixed_fuel_kg_h=float(fixed_flow),
                   lhv_b0=float(lhv0),lhv_b100=float(lhv100),
                   cn_override=float(cn) if cn_user else None,
                   pressure_ratio_max=float(prmax),intake_temp_k=float(intake_c)+273.15,
@@ -164,7 +263,8 @@ settings=Settings(rpm=int(rpm),load_pct=float(load),b_pct=b_pct,mode=mode,
                   fuel_scheme="biodiesel" if blend_mode.startswith("Biodiesel") else "ppo",
                   ppo_pct=ppo_pct,b50_pct=b50_pct)
 
-if "sim_result" not in st.session_state or submitted:
+if ("sim_result" not in st.session_state or submitted
+    or st.session_state["sim_result"]["settings"].variant != variant):
     try:
         with st.spinner("Menghitung siklus 0D dengan integrator Heun RK2..."):
             sim=model(settings)
@@ -172,7 +272,8 @@ if "sim_result" not in st.session_state or submitted:
         st.session_state["run_time"]=datetime.now().strftime("%d/%m/%Y %H:%M")
         hist=st.session_state.get("history",[])
         scenario=sim["focus"]["scenario"]
-        hist.insert(0,{"waktu":st.session_state["run_time"],"rpm":settings.rpm,
+        hist.insert(0,{"waktu":st.session_state["run_time"],"variant":settings.variant,
+                       "rpm":settings.rpm,
                        "load_pct":settings.load_pct,"jenis":scenario["series"],
                        "mode":settings.mode,"torque_nm":scenario["torque_nm"],
                        "power_kw":scenario["power_kw"],"bte_pct":scenario["bte_pct"],
@@ -184,27 +285,33 @@ if "sim_result" not in st.session_state or submitted:
 
 sim=st.session_state["sim_result"]
 actual=sim["settings"]
+active_profile=sim["profile"]
 ref=sim["focus"]["reference"]
 sc=sim["focus"]["scenario"]
 frame=clean_df(sim)
-pnm=load_pnm()
+pnm, pnm_source=load_pnm()
 
-st.markdown("""
+st.markdown(f"""
 <div class="hero">
   <small>ONLINE ENGINE LAB · PHYSICS-BASED MODEL</small>
   <h1>Toyota 2KD-FTV Engine Simulator</h1>
-  <p>Simulasi interaktif performa dan pembakaran mesin diesel 2WD generasi awal.
-     Berbasis persamaan termodinamika 0D dan data referensi, tanpa machine learning.</p>
-  <div class="hero-tags"><span>4 silinder · 2.494 cc</span><span>CR 18,5:1</span>
-    <span>Heun RK2</span><span>B0–B100</span><span>Cloud Edition</span></div>
+  <p>Simulasi interaktif Toyota 2KD-FTV {active_profile.label}:
+     {active_profile.rated_power_kw:g} kW @ {active_profile.rated_rpm:,} rpm, tanpa machine learning.</p>
+  <div class="hero-tags"><span>{active_profile.label}</span><span>4 silinder · 2.494 cc</span>
+    <span>CR 18,5:1</span><span>Heun RK2</span><span>B0–B100</span><span>Cloud V3 · Dual Variant</span></div>
 </div>
 """,unsafe_allow_html=True)
 if actual != settings:
     st.info("Input di sisi kiri telah berubah tetapi hasil masih berasal dari simulasi sebelumnya. Klik **Jalankan simulasi** untuk memperbarui.")
 
 st.markdown(f"""<div class="appnote"><strong>Skenario:</strong> {sc['series']} ·
-<strong>{actual.rpm:,} rpm</strong> · <strong>{actual.load_pct:g}% beban</strong> ·
-<strong>{'torsi target tetap' if actual.mode=='fixed_torque' else 'jumlah injeksi tetap'}</strong>.
+<strong>{active_profile.label}</strong> · <strong>{actual.rpm:,} rpm</strong> · <strong>{actual.load_pct:g}% beban</strong> ·
+<strong>{next((label for label,value in {
+ 'Torsi target per RPM':'fixed_torque',
+ 'Injeksi skenario sama dengan B0 per RPM':'fixed_injection',
+ 'Massa injeksi sama untuk semua RPM':'fixed_mass_cycle',
+ 'Laju bahan bakar sama untuk semua RPM':'fixed_fuel_flow'
+}.items() if value==actual.mode),'mode tak dikenal')}</strong>.
 Hasil ini adalah <strong>estimasi model</strong>, belum dikalibrasi penuh dengan mesin aktual.</div>""",unsafe_allow_html=True)
 
 tabs=st.tabs(["📊 Ringkasan", "⚡ Kurva performa", "🔥 Pembakaran 0D",
@@ -223,16 +330,22 @@ with tabs[0]:
     b.metric("Puncak tekanan",fmt(sc["pmax_bar"],"bar"))
     c.metric("Ignition delay",fmt(sc["ign_delay_deg"],"°CA"))
     d.metric("Residual energi",fmt(sc["energy_residual_pct"],"%",4))
+    st.caption(f"Profil aktif: **{active_profile.label}** · boost PR asumsi maksimum **{sc['turbo_pr_max_setting']:.2f}** · "
+               "rating pabrikan adalah input acuan, bukan titik validasi independen.")
     if sc["limited"]:
-        st.warning("Target simulasi tidak sepenuhnya tercapai atau suplai bahan bakar dibatasi model. Periksa RPM, beban, dan parameter.")
+        st.warning("Target simulasi tidak sepenuhnya tercapai atau jumlah bahan bakar dibatasi oleh asumsi udara/AFR. Periksa grafik jumlah injeksi dan pengaturan boost.")
+    if actual.rpm>2250:
+        st.info("RPM fokus di luar rentang data PNM (1.250–2.250 rpm). Hasil adalah model 0D, bukan validasi PNM.")
+    if actual.rpm>active_profile.rated_rpm:
+        st.warning("RPM fokus berada di atas rated power RPM profil yang dipilih. Envelope di area ini hanya asumsi dan tidak terverifikasi.")
     if sc["fuel_properties"].get("flash_c", 100) < 52:
         st.warning("Flash point campuran diperkirakan di bawah 52 °C. Ini hanya pemeriksaan ilustratif, bukan penetapan kelayakan bahan bakar. Jangan menguji campuran pada mesin tanpa evaluasi keselamatan dan mutu yang memadai.")
     col1,col2=st.columns(2)
     with col1:
-        st.plotly_chart(line_chart(frame,"torque_nm","Torsi terhadap putaran","Torsi (Nm)"),use_container_width=True)
+        st.plotly_chart(line_chart(frame,"torque_nm","Torsi terhadap putaran","Torsi (Nm)",nominal=True,profile=active_profile),use_container_width=True)
     with col2:
-        st.plotly_chart(line_chart(frame,"power_kw","Daya terhadap putaran","Daya (kW)"),use_container_width=True)
-    st.caption("Konsumsi bahan bakar, BSFC, dan BTE di sini SEMUANYA hasil model. Kolom fuel consumption PNM tidak dibaca.")
+        st.plotly_chart(line_chart(frame,"power_kw","Daya terhadap putaran","Daya (kW)",nominal=True,profile=active_profile),use_container_width=True)
+    st.caption("Konsumsi bahan bakar, BSFC, dan BTE adalah hasil model. Fuel consumption PNM tidak dibaca. Identitas varian PNM belum dikonfirmasi sehingga PNM tidak digunakan untuk kalibrasi khusus 2WD/4WD.")
 
 with tabs[1]:
     col1,col2=st.columns(2)
@@ -242,7 +355,43 @@ with tabs[1]:
     col1,col2=st.columns(2)
     with col1: st.plotly_chart(line_chart(frame,"fuel_kg_h","Konsumsi bahan bakar MODEL","kg/jam"),use_container_width=True)
     with col2: st.plotly_chart(line_chart(frame,"bmep_bar","BMEP model","bar"),use_container_width=True)
-    st.info("Mode **torsi target tetap** akan menghasilkan torsi dan daya hampir sama antara B0 dan campuran jika model dapat mencapai target. Perubahan terutama terlihat pada kebutuhan injeksi dan efisiensi. Gunakan **jumlah injeksi tetap** untuk melihat respons torsi/daya akibat perubahan bahan bakar.")
+    st.info(f"**Profil {active_profile.label}:** rating Toyota "
+            f"**{active_profile.rated_power_kw:g} kW pada {active_profile.rated_rpm:,} rpm**; "
+            f"torsi maksimum {active_profile.max_torque_nm:g} Nm pada "
+            f"{active_profile.torque_plateau_start_rpm:,}–{active_profile.torque_plateau_end_rpm:,} rpm. "
+            "Kurva penghubung antartitik spesifikasi merupakan **interpolasi asumsi**, bukan dynotest Toyota.")
+    if any(frame["above_rated_rpm"]):
+        st.warning(f"{active_profile.label} memiliki titik sweep di atas rated RPM "
+                   f"({active_profile.rated_rpm:,}). Titik tersebut untuk eksplorasi saja; "
+                   "bukan klaim batas putaran maksimum/karakteristik ECU.")
+    with st.expander("Bandingkan envelope nominal 2WD vs 4WD (bukan data dynotest)"):
+        a,b=st.columns(2)
+        with a: st.plotly_chart(variant_nominal_chart("torque_nm"),use_container_width=True)
+        with b: st.plotly_chart(variant_nominal_chart("power_kw"),use_container_width=True)
+        st.caption("Titik rating dan plateau berasal dari Toyota; nilai pada RPM lain adalah interpolasi/ekstrapolasi asumsi.")
+    st.subheader("Audit definisi injeksi & kondisi operasi")
+    st.caption("Grafik ini wajib diperiksa bersama kurva daya. 'Injeksi tetap' tidak selalu berarti laju bahan bakar tetap. Dua grafik berikut menggunakan massa injeksi AKTUAL sesudah pembatasan udara pada model.")
+    c1,c2=st.columns(2)
+    with c1: st.plotly_chart(line_chart(frame,"fuel_mg_cycle_cyl","Massa per siklus per silinder","mg/siklus/silinder"),use_container_width=True)
+    with c2: st.plotly_chart(line_chart(frame,"fuel_kg_h","Laju massa total mesin (hasil model)","kg/jam"),use_container_width=True)
+    capped=frame[frame["fuel_capped_by_air"]==True]  # noqa: E712
+    exceeds=frame[frame["above_rated_torque"]==True]  # noqa: E712
+    if len(exceeds):
+        st.warning(f"Terdapat {len(exceeds)} titik yang menghasilkan torsi lebih dari 102% envelope nominal. Ini hasil skenario injeksi terbuka, bukan titik operasi yang sudah dijamin mampu dicapai ECU/mesin.")
+    if len(capped):
+        st.warning(f"Terdapat {len(capped)} titik yang dibatasi asumsi udara/AFR. Pada titik itu jumlah injeksi atau laju bahan bakar yang diminta TIDAK bisa dijaga konstan; lihat kolom 'requested' di CSV.")
+    if actual.mode=='fixed_torque':
+        st.info("**Torsi target per RPM:** besar torsi ditentukan dari persentase envelope nominal, kemudian massa injeksi dicari melalui iterasi. Kemiripan kurva B0–B50 adalah konsekuensi kontrol torsi, bukan prediksi efek bahan bakar terhadap daya maksimum.")
+    elif actual.mode=='fixed_injection':
+        st.info("**Skenario = B0 di masing-masing RPM:** jumlah injeksi B0 disetel ulang untuk setiap RPM agar mencapai torsi target; B50 menggunakan jumlah yang sama pada RPM tersebut. Karena itu massa injeksi TIDAK konstan sepanjang sweep RPM.")
+    elif actual.mode=='fixed_mass_cycle':
+        st.info(f"**Massa injeksi benar-benar konstan:** target {actual.fixed_mg_cycle_cyl:g} mg/siklus/silinder pada seluruh RPM untuk kedua bahan bakar. Jika tidak dibatasi udara, laju massa bahan bakar naik sebanding RPM. Setelan boost masih ditentukan oleh parameter beban, bukan ECU aktual.")
+    else:
+        st.info(f"**Laju bahan bakar benar-benar konstan:** target {actual.fixed_fuel_kg_h:g} kg/jam pada seluruh RPM untuk kedua bahan bakar. Massa per siklus turun ~1/RPM. Jika dibatasi udara, target aliran tidak akan tercapai pada beberapa titik.")
+    st.caption("Rentang data PNM berhenti pada 2.250 rpm dan identitas varian PNM belum dipastikan. Titik model menggunakan profil 2WD/4WD terpilih beserta asumsi matematis masing-masing.")
+    st.subheader("Tabel audit hasil versus envelope")
+    audit_cols=["variant","series","rpm","torque_nm","power_kw","rated_torque_nm","rated_power_kw","fuel_mg_cycle_cyl","requested_fuel_mg_cycle_cyl","fuel_kg_h","requested_fuel_kg_h","fuel_capped_by_air","above_rated_torque","outside_pnm_rpm","above_rated_rpm","limited"]
+    st.dataframe(frame[audit_cols].round(3),hide_index=True,use_container_width=True)
 
 with tabs[2]:
     c1,c2=st.columns(2)
@@ -269,7 +418,13 @@ with tabs[2]:
     st.warning("NOx dan smoke hanya indikator tren model; **tidak** boleh dibandingkan langsung dengan ppm NOx atau persentase smoke dari pengujian PNM. CO₂ ideal menganggap semua karbon menjadi CO₂.")
 
 with tabs[3]:
-    st.info("Data eksperimen PNM berisi 5 RPM × 2 bahan bakar. **Beban pengujian belum dipastikan**, sehingga grafik ini hanya pembanding deskriptif, bukan validasi kuantitatif langsung pada beban simulasi.")
+    if pnm_source != "file GitHub":
+        st.warning("File `data/pnm_b0_b50.csv` belum ditemukan atau tidak sesuai di repository GitHub. Dashboard tetap berjalan dengan **salinan data PNM tertanam** yang identik dengan dataset hasil audit sebelumnya. Untuk memutakhirkan data PNM, unggah file CSV yang benar ke GitHub.")
+    st.warning(f"**Status data PNM: varian mesin pengujian belum dikonfirmasi.** "
+               f"Walaupun simulator sedang memilih **{active_profile.label}**, "
+               "data PNM **belum dapat diasumsikan mewakili profil 2WD maupun 4WD**. "
+               "Kondisi beban pengujian juga belum dipastikan. Grafik hanya pembanding deskriptif, "
+               "bukan validasi langsung keluaran model pada varian terpilih.")
     var_options={
        "Torsi (Nm)":"torque_nm", "Daya (kW)":"power_kw", "NOx (ppm)":"nox_ppm",
        "CO (ppm)":"co_ppm", "CO₂ (%vol)":"co2_pct", "HC (ppm)":"hc_ppm",
@@ -285,8 +440,8 @@ with tabs[3]:
         st.dataframe(pivot,hide_index=True,use_container_width=True)
     with c2:
         st.markdown("**Asal data**")
-        st.write("Dataset PNM average.xlsx (ringkasan data yang sudah diaudit sebelumnya).")
-        st.write("Hanya dipakai kolom daya, torsi dan emisi. Data fuel consumption **tidak disimpan dan tidak dihitung**.")
+        st.write(f"Dataset PNM average.xlsx (hasil audit). Sumber yang dimuat: {pnm_source}.")
+        st.write("Varian mesin dan kesetaraan beban PNM masih belum diketahui. Hanya dipakai kolom daya, torsi dan emisi. Data fuel consumption **tidak disimpan dan tidak dihitung**.")
     st.download_button("⬇ Unduh data eksperimen PNM (tanpa fuel consumption)",
         data=csv_bytes(pnm),file_name="data_PNM_B0_B50_tanpa_fuel_consumption.csv",mime="text/csv")
 
@@ -312,10 +467,10 @@ with tabs[4]:
 with tabs[5]:
     st.subheader("Ekspor hasil simulasi")
     st.download_button("⬇ Unduh ringkasan seluruh RPM (CSV)",
-        data=csv_bytes(frame),file_name="simulasi_2KD_FTV_ringkasan.csv",mime="text/csv")
+        data=csv_bytes(frame),file_name=f"simulasi_2KD_FTV_{actual.variant}_V3.csv",mime="text/csv")
     tr=pd.DataFrame(sc["trace"])
     st.download_button("⬇ Unduh kurva silinder skenario (CSV)",
-        data=csv_bytes(tr),file_name="simulasi_2KD_FTV_trace_silinder.csv",mime="text/csv")
+        data=csv_bytes(tr),file_name=f"simulasi_2KD_FTV_{actual.variant}_trace.csv",mime="text/csv")
     history=pd.DataFrame(st.session_state.get("history",[]))
     st.subheader("Riwayat simulasi di sesi browser ini")
     st.dataframe(history,hide_index=True,use_container_width=True)
@@ -330,11 +485,17 @@ with tabs[5]:
 - **Pembakaran:** dua fungsi Wiebe (premixed dan diffusion); asumsi model empiris.
 - **Termodinamika:** satu-zona hukum I, perpindahan panas Woschni, integrator Heun/RK2 0,5°CA.
 - **Kinerja:** IMEP → dikurangi FMEP (mirip Chen–Flynn) dan PMEP → BMEP, torsi, daya, BSFC dan BTE **hasil model**.
+- **Profil Engine Variant V3:** 2WD awal = 65 kW @ 3.800 rpm, 192 Nm @ 1.200–3.000 rpm; 4WD awal = 75 kW @ 3.600 rpm, 260 Nm @ 1.600–2.400 rpm. Geometri dan rasio kompresi sama menurut Toyota New Features (hal. 19).
+- **Envelope full load:** nilai di antara plateau torsi dan rating daya dihitung dengan interpolasi linier ASUMSI. Endpoint 1.000 rpm untuk kedua varian serta area 4WD di atas 3.600 rpm juga ASUMSI, bukan titik pengujian; ECU dan sistem turbo masing-masing varian dapat berbeda.
+- **Asumsi boost per varian:** PR maksimum 2WD 1,65 dan 4WD 1,80 hanyalah nilai awal skenario; bisa diubah di sidebar. Bukan peta tekanan boost mesin asli. Tanpa data ECU, pengubahan varian TIDAK otomatis memberikan model turbo/injeksi 4WD yang tervalidasi.
+- **Mode injeksi:** `fixed_injection` lama berarti massa B50 = B0 *pada setiap RPM* (tidak tetap sepanjang sweep); `fixed_mass_cycle` menjaga mg/siklus/silinder; `fixed_fuel_flow` menjaga kg/jam. Ketiga konsep berbeda.
+- **Turbo & pembatasan udara:** fraksi beban di mode fixed-fuel adalah input parameter boost yang belum ditutup dengan umpan balik output aktual. Saat suplai dipotong oleh batas AFR, mode "konstan" tidak lagi tercapai; dashboard memberi peringatan.
+- **Rentang PNM:** hanya 1.250–2.250 rpm. **Identitas varian PNM belum terverifikasi** sehingga tidak diklaim cocok untuk 2WD atau 4WD. Data PNM TIDAK digunakan untuk menghitung kurva simulasi > 2.250 rpm; berlaku asumsi model dan profil rating Toyota yang dipilih. Mencapai titik rating pada mode torsi target BUKAN validasi independen.
 - **Emisi:** NOx dan smoke hanya indeks relatif; CO₂ merupakan batas ideal neraca karbon, bukan emisi tailpipe.
 - **Validasi:** data PNM punya RPM, torsi/daya dan emisi, tetapi belum ada kepastian kondisi beban maupun satuan fuel consumption. Karena itu tidak mengklaim model sudah tervalidasi.
-- **Wilayah berlaku:** steady-state, rentang dan metode asumsi pada profil 2KD-FTV 2WD generasi awal; tidak untuk diagnosis kerusakan atau kepatuhan emisi.
+- **Wilayah berlaku:** steady-state, dua profil 2KD-FTV 2WD/4WD generasi awal dan asumsi masing-masing; tidak untuk diagnosis kerusakan atau kepatuhan emisi.
 """)
     st.caption("Referensi utama: J.B. Heywood, Internal Combustion Engine Fundamentals; kode starter PPO-M pengguna; dokumen spesifikasi Toyota 2KD-FTV 2WD awal; data PNM dan tabel fuel properties yang pengguna kirim.")
 
 st.divider()
-st.caption(f"Toyota 2KD-FTV · Engine Lab Cloud | Hasil terakhir: {st.session_state.get('run_time','—')} | Non-ML · Streamlit Community Cloud · Penyimpanan hanya selama sesi")
+st.caption(f"Toyota 2KD-FTV {active_profile.label} · Engine Lab Cloud V3 | Hasil terakhir: {st.session_state.get('run_time','—')} | Non-ML · Streamlit Community Cloud · Penyimpanan hanya selama sesi")
