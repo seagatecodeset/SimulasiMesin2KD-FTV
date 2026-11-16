@@ -189,7 +189,7 @@ def fmt(v, unit="", decimals=2):
 
 # ================ CONTROLS ================
 st.sidebar.title("⚙️ Kendali Simulasi")
-st.sidebar.caption("Toyota 2KD-FTV · 2.494 cc · CR 18,5:1 · **V3**")
+st.sidebar.caption("Toyota 2KD-FTV · 2.494 cc · CR 18,5:1 · **V3.1**")
 variant_labels = {"2WD awal · 65 kW": "2wd", "4WD awal · 75 kW": "4wd"}
 variant_label = st.sidebar.selectbox("Engine Variant", list(variant_labels),
                                      index=0, key="engine_variant_choice",
@@ -200,32 +200,79 @@ st.sidebar.caption(f"**{selected_profile.rated_power_kw:g} kW @ {selected_profil
                    f"**{selected_profile.max_torque_nm:g} Nm @ "
                    f"{selected_profile.torque_plateau_start_rpm:,}–{selected_profile.torque_plateau_end_rpm:,} rpm**")
 st.sidebar.caption("Atur input dan tekan Jalankan simulasi. Mengganti varian langsung memperbarui hasil.")
+# V3.1: pilihan mode berada DI LUAR st.form supaya perubahan opsi
+# langsung memperbarui penjelasan, tanpa menunggu tombol Jalankan simulasi.
+mode_options={
+    "Torsi target per RPM (default)":"fixed_torque",
+    "Injeksi skenario = B0 pada masing-masing RPM":"fixed_injection",
+    "Massa injeksi konstan pada seluruh RPM (mg/siklus/silinder)":"fixed_mass_cycle",
+    "Laju aliran bahan bakar konstan pada seluruh RPM (kg/jam)":"fixed_fuel_flow",
+}
+mode_help={
+    "fixed_torque": (
+        "**Mode 1 — Torsi target per RPM**\n\n"
+        "**Yang dijaga:** torsi target mengikuti persentase beban terhadap "
+        "kurva torsi referensi varian mesin pada setiap RPM.\n\n"
+        "**Cara kerja:** model mencari jumlah injeksi B0 dan bahan bakar skenario "
+        "secara terpisah agar torsi target tercapai, jika memungkinkan.\n\n"
+        "**Cocok untuk:** membandingkan kebutuhan bahan bakar, BSFC, dan BTE "
+        "pada torsi yang sama. Kurva torsi/daya B0 dan B50 dapat hampir berhimpit."
+    ),
+    "fixed_injection": (
+        "**Mode 2 — Massa skenario mengikuti B0 pada setiap RPM**\n\n"
+        "**Yang dijaga:** massa injeksi B0 dan bahan bakar skenario "
+        "**sama pada RPM yang sedang dihitung**.\n\n"
+        "**Cara kerja:** model mencari injeksi B0 untuk torsi target di masing-masing RPM, "
+        "lalu memakai massa yang sama untuk bahan bakar skenario. "
+        "**Massa injeksi masih berubah antar-RPM**.\n\n"
+        "**Cocok untuk:** membandingkan respons torsi/daya saat sifat bahan bakar "
+        "diganti dengan suplai massa yang sama pada titik RPM tersebut."
+    ),
+    "fixed_mass_cycle": (
+        "**Mode 3 — Massa injeksi per siklus konstan**\n\n"
+        "**Yang dijaga:** massa injeksi dalam **mg/siklus/silinder** sama untuk "
+        "B0, skenario, dan seluruh RPM.\n\n"
+        "**Akibatnya:** total laju bahan bakar **kg/jam meningkat seiring RPM** "
+        "(jika target injeksi tercapai). Misal 30 mg/siklus/silinder: "
+        "7,20 kg/jam pada 2.000 RPM dan 12,24 kg/jam pada 3.400 RPM.\n\n"
+        "**Cocok untuk:** analisis respons mesin terhadap RPM dengan massa per siklus tetap."
+    ),
+    "fixed_fuel_flow": (
+        "**Mode 4 — Laju aliran bahan bakar konstan**\n\n"
+        "**Yang dijaga:** laju total bahan bakar dalam **kg/jam** sama untuk B0, "
+        "skenario, dan seluruh RPM.\n\n"
+        "**Akibatnya:** massa injeksi **mg/siklus/silinder berkurang saat RPM naik**. "
+        "Misal 6 kg/jam: 25 mg/siklus/silinder pada 2.000 RPM dan "
+        "14,71 mg/siklus/silinder pada 3.400 RPM.\n\n"
+        "**Cocok untuk:** simulasi suplai bahan bakar total yang dibatasi."
+    ),
+}
+mode_label=st.sidebar.selectbox(
+    "Mode pengendalian bahan bakar", list(mode_options), index=0,
+    key="fuel_control_mode_choice",
+    help="Pilih mode untuk langsung melihat keterangannya di bawah menu. "
+         "Hasil simulasi baru dihitung setelah klik Jalankan simulasi.",
+)
+mode=mode_options[mode_label]
+st.sidebar.info(mode_help[mode])
+st.sidebar.caption(
+    "Catatan: mode injeksi ini adalah skenario model, bukan pemetaan ECU "
+    "common-rail Toyota yang telah diverifikasi. Jika suplai udara terbatas, "
+    "injeksi aktual dapat lebih rendah daripada nilai yang diminta."
+)
+
 with st.sidebar.form("simulation_input"):
     rpm=st.number_input("Putaran mesin (rpm)",min_value=1000,max_value=3800,value=2000,step=50)
     load=st.slider("Beban relatif terhadap torsi referensi (%)", min_value=10,max_value=100,value=50,step=5,
                    help="Beban 100% mengacu pada envelope torsi profil 2WD/4WD yang dipilih, bukan data ECU aktual.")
-    mode_options={
-       "Torsi target per RPM (default)":"fixed_torque",
-       "Injeksi skenario = B0 pada masing-masing RPM":"fixed_injection",
-       "Massa injeksi konstan pada seluruh RPM (mg/siklus/silinder)":"fixed_mass_cycle",
-       "Laju aliran bahan bakar konstan pada seluruh RPM (kg/jam)":"fixed_fuel_flow",
-    }
-    mode_label=st.selectbox("Mode pengendalian bahan bakar",list(mode_options),index=0)
-    mode=mode_options[mode_label]
     fixed_mg=30.0
     fixed_flow=6.0
     if mode=="fixed_mass_cycle":
         fixed_mg=st.number_input("Massa injeksi TETAP (mg/siklus/silinder)",
                        min_value=2.0,max_value=100.0,value=30.0,step=1.0)
-        st.caption("Jumlah mg/siklus/silinder sama untuk B0, skenario, dan semua RPM; kg/jam meningkat sebanding RPM bila tidak dibatasi udara.")
     elif mode=="fixed_fuel_flow":
         fixed_flow=st.number_input("Laju massa bahan bakar TETAP (kg/jam total mesin)",
                        min_value=0.5,max_value=100.0,value=6.0,step=0.5)
-        st.caption("Laju kg/jam sama untuk B0, skenario, dan semua RPM; mg/siklus menurun saat RPM meningkat bila tidak dibatasi udara.")
-    elif mode=="fixed_injection":
-        st.caption("B0 diselesaikan untuk torsi target di setiap RPM. Massa skenario disamakan dengan massa B0 PADA RPM ITU; nilainya berbeda antar-RPM.")
-    else:
-        st.caption("Target torsi mengikuti persentase kurva nominal yang diasumsikan. Model mengiterasi kebutuhan bahan bakar untuk mencapai torsi tersebut.")
     blend_mode=st.radio("Jenis campuran",["Biodiesel B0–B100","PPO-M + Dex + B50 (ilustratif)"],index=0)
     b_pct=50.0
     ppo_pct=0.0
@@ -298,7 +345,7 @@ st.markdown(f"""
   <p>Simulasi interaktif Toyota 2KD-FTV {active_profile.label}:
      {active_profile.rated_power_kw:g} kW @ {active_profile.rated_rpm:,} rpm, tanpa machine learning.</p>
   <div class="hero-tags"><span>{active_profile.label}</span><span>4 silinder · 2.494 cc</span>
-    <span>CR 18,5:1</span><span>Heun RK2</span><span>B0–B100</span><span>Cloud V3 · Dual Variant</span></div>
+    <span>CR 18,5:1</span><span>Heun RK2</span><span>B0–B100</span><span>Cloud V3.1 · Dual Variant</span></div>
 </div>
 """,unsafe_allow_html=True)
 if actual != settings:
