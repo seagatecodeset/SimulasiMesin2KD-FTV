@@ -17,7 +17,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from physics import (Settings, REFERENCE_FUELS, V_TOTAL, CR, BORE_M, STROKE_M,
-                     ENGINE_PROFILES, get_engine_profile, full_load_torque, run_sweep)
+                     ENGINE_PROFILES, get_engine_profile, full_load_torque, run_sweep,
+                     FuelComponent, DEFAULT_B0, DEFAULT_B100, DEFAULT_PPO)
 
 ROOT = Path(__file__).resolve().parent
 PNM_PATH = ROOT / "data" / "pnm_b0_b50.csv"
@@ -166,13 +167,15 @@ def experiment_chart(pnm, variable, label):
 
 
 def clean_df(results):
-    keys = ["variant","engine_profile","rpm","series","fuel_pct","torque_nm","power_kw","bmep_bar",
-            "imep_bar","fmep_bar","bsfc_g_kwh","bte_pct","fuel_kg_h",
-            "fuel_mg_cycle_cyl","lambda_air","pmax_bar","soc_deg","ca50_deg",
+    keys = ["variant","engine_profile","rpm","series","fuel_pct","fuel_family","fuel_p_pct","fuel_recipe","torque_nm","power_kw","bmep_bar",
+            "imep_bar","fmep_bar","bsfc_g_kwh","bte_pct","fuel_kg_h","fuel_l_h",
+            "fuel_chemical_kw","fuel_volume_mm3_cycle_cyl","fuel_density_kg_m3",
+            "fuel_lhv_mj_kg","fuel_mg_cycle_cyl","lambda_air","pmax_bar","soc_deg","ca50_deg",
             "ign_delay_deg","nox_rel_pct","smoke_rel_pct","co2_ideal_kg_h",
             "energy_residual_pct","limited","rated_torque_nm","rated_power_kw",
             "nominal_load_torque_nm","requested_fuel_mg_cycle_cyl",
             "air_fuel_limit_mg_cycle_cyl","requested_fuel_kg_h",
+            "requested_fuel_volume_mm3_cycle_cyl","requested_fuel_l_h",
             "fuel_capped_by_air","above_rated_torque","outside_pnm_rpm",
             "above_rated_rpm","pnm_variant_verified","turbo_pr_assumed","turbo_pr_max_setting"]
     return pd.DataFrame([{k: p.get(k) for k in keys} for p in results["points"]])
@@ -189,7 +192,7 @@ def fmt(v, unit="", decimals=2):
 
 # ================ CONTROLS ================
 st.sidebar.title("⚙️ Kendali Simulasi")
-st.sidebar.caption("Toyota 2KD-FTV · 2.494 cc · CR 18,5:1 · **V3.1**")
+st.sidebar.caption("Toyota 2KD-FTV · 2.494 cc · CR 18,5:1 · **V4**")
 variant_labels = {"2WD awal · 65 kW": "2wd", "4WD awal · 75 kW": "4wd"}
 variant_label = st.sidebar.selectbox("Engine Variant", list(variant_labels),
                                      index=0, key="engine_variant_choice",
@@ -207,6 +210,7 @@ mode_options={
     "Injeksi skenario = B0 pada masing-masing RPM":"fixed_injection",
     "Massa injeksi konstan pada seluruh RPM (mg/siklus/silinder)":"fixed_mass_cycle",
     "Laju aliran bahan bakar konstan pada seluruh RPM (kg/jam)":"fixed_fuel_flow",
+    "Volume injeksi konstan pada seluruh RPM (mm³/siklus/silinder)":"fixed_volume_cycle",
 }
 mode_help={
     "fixed_torque": (
@@ -246,6 +250,16 @@ mode_help={
         "14,71 mg/siklus/silinder pada 3.400 RPM.\n\n"
         "**Cocok untuk:** simulasi suplai bahan bakar total yang dibatasi."
     ),
+    "fixed_volume_cycle": (
+        "**Mode 5 — Volume injeksi konstan**\n\n"
+        "**Yang dijaga:** volume injeksi dalam **mm³/siklus/silinder** sama pada "
+        "semua RPM dan untuk B0 serta bahan bakar skenario.\n\n"
+        "**Cara kerja:** massa injeksi = volume × densitas. Karena densitas B0, "
+        "biodiesel, dan PPO berbeda, **laju massa kg/jam dan energi masuk dapat berbeda**. "
+        "Volume aliran total L/jam meningkat seiring RPM jika tidak dibatasi udara.\n\n"
+        "**Batas model:** ini adalah volume bahan bakar teoritis, bukan pulsa ECU "
+        "atau debit injektor aktual; efek tekanan rail dan sifat injeksi tidak dimodelkan."
+    ),
 }
 mode_label=st.sidebar.selectbox(
     "Mode pengendalian bahan bakar", list(mode_options), index=0,
@@ -261,54 +275,113 @@ st.sidebar.caption(
     "injeksi aktual dapat lebih rendah daripada nilai yang diminta."
 )
 
+# Asumsi properti bawaan dipisah dari nilai campuran akhir hasil ukur.
+def fuel_component_editor(label: str, prefix: str, default: FuelComponent) -> FuelComponent:
+    """Di dalam form; perubahan baru masuk solver ketika 'Jalankan' ditekan."""
+    with st.expander(label, expanded=False):
+        st.caption("Isi dari hasil pengukuran atau COA jika tersedia; nilai awal hanya referensi/asumsi.")
+        density=st.number_input("Density @15°C (kg/m³)",min_value=500.0,max_value=1200.0,
+                  value=float(default.density_kg_m3),step=1.0,key=f"{prefix}_rho")
+        viscosity=st.number_input("Viscosity @40°C (mm²/s)",min_value=0.21,max_value=100.0,
+                  value=float(default.viscosity_cst),step=0.1,key=f"{prefix}_visc")
+        lhv=st.number_input("LHV (MJ/kg; bukan HHV)",min_value=15.0,max_value=55.0,
+                  value=float(default.lhv_mj_kg),step=0.2,key=f"{prefix}_lhv")
+        cetane=st.number_input("Cetane number / proxy",min_value=10.0,max_value=100.0,
+                  value=float(default.cetane_proxy),step=1.0,key=f"{prefix}_cn")
+        flash=st.number_input("Flash point (°C)",min_value=-50.0,max_value=300.0,
+                  value=float(default.flash_c),step=1.0,key=f"{prefix}_flash")
+        C=st.number_input("C (% massa)",min_value=0.0,max_value=100.0,
+                  value=float(default.C_pct),step=0.5,key=f"{prefix}_carbon")
+        H=st.number_input("H (% massa)",min_value=0.0,max_value=100.0,
+                  value=float(default.H_pct),step=0.5,key=f"{prefix}_hydrogen")
+        O=st.number_input("O (% massa)",min_value=0.0,max_value=100.0,
+                  value=float(default.O_pct),step=0.5,key=f"{prefix}_oxygen")
+        st.caption("Pastikan total C+H+O 90–100% massa. Selisih dapat mencakup N, S, dan unsur lain.")
+    return FuelComponent(float(density),float(viscosity),float(lhv),float(cetane),
+                         float(flash),float(C),float(H),float(O))
+
+# Pilihan keluarga dan editor manual DI LUAR form: pilihan langsung mengubah tampilan.
+blend_mode=st.sidebar.radio("Jenis campuran bahan bakar",[
+      "Biodiesel B0–B100 (B0 + B100)",
+      "Pirolisis Plastic Oil P0–P100 (B0 + PPO)",
+      "PPO + B0 + B50 (opsi V3 lanjutan)"],index=0,key="blend_family_v4")
+with st.sidebar.expander("✍️ Pengaturan fuel properties manual",expanded=False):
+    manual_components=st.checkbox("Input manual sifat B0 / B100 / PPO",value=False,
+                key="edit_components_v4",
+                help="Jika aktif, data komponen dimasukkan di form bawah.")
+    manual_final=st.checkbox("Override properti CAMPURAN AKHIR hasil lab",value=False,
+                key="edit_final_v4",
+                help="Menggantikan mixing rule untuk bahan bakar skenario.")
+
 with st.sidebar.form("simulation_input"):
     rpm=st.number_input("Putaran mesin (rpm)",min_value=1000,max_value=3800,value=2000,step=50)
-    load=st.slider("Beban relatif terhadap torsi referensi (%)", min_value=10,max_value=100,value=50,step=5,
-                   help="Beban 100% mengacu pada envelope torsi profil 2WD/4WD yang dipilih, bukan data ECU aktual.")
+    load=st.slider("Beban relatif terhadap torsi referensi (%)",min_value=10,max_value=100,value=50,step=5,
+                   help="Beban 100% mengikuti kurva acuan 2WD/4WD; bukan pembacaan ECU")
     fixed_mg=30.0
     fixed_flow=6.0
+    fixed_vol=30.0
     if mode=="fixed_mass_cycle":
-        fixed_mg=st.number_input("Massa injeksi TETAP (mg/siklus/silinder)",
-                       min_value=2.0,max_value=100.0,value=30.0,step=1.0)
+        fixed_mg=st.number_input("Massa injeksi tetap (mg/siklus/silinder)",
+                         min_value=2.0,max_value=100.0,value=30.0,step=1.0)
     elif mode=="fixed_fuel_flow":
-        fixed_flow=st.number_input("Laju massa bahan bakar TETAP (kg/jam total mesin)",
-                       min_value=0.5,max_value=100.0,value=6.0,step=0.5)
-    blend_mode=st.radio("Jenis campuran",["Biodiesel B0–B100","PPO-M + Dex + B50 (ilustratif)"],index=0)
-    b_pct=50.0
+        fixed_flow=st.number_input("Laju massa tetap (kg/jam total mesin)",
+                           min_value=0.5,max_value=100.0,value=6.0,step=.5)
+    elif mode=="fixed_volume_cycle":
+        fixed_vol=st.number_input("Volume injeksi tetap (mm³/siklus/silinder)",
+                          min_value=1.0,max_value=150.0,value=30.0,step=1.0,
+                          help="Volume per siklus per silinder, bukan volume total 4 silinder.")
+    b_pct=0.0
     ppo_pct=0.0
     b50_pct=0.0
-    if blend_mode=="Biodiesel B0–B100":
-        b_pct=float(st.slider("Kadar biodiesel (% volume)",0,100,50,5))
+    if blend_mode.startswith("Biodiesel"):
+        b_pct=float(st.slider("Biodiesel (B0–B100, % volume)",0,100,50,5))
+        st.caption(f"B{b_pct:g}: {100-b_pct:g}%vol B0 + {b_pct:g}%vol B100")
+    elif blend_mode.startswith("Pirolisis"):
+        ppo_pct=float(st.slider("PPO (P0–P100, % volume)",0,100,50,5))
+        st.caption(f"P{ppo_pct:g}: {100-ppo_pct:g}%vol B0 + {ppo_pct:g}%vol PPO")
+        st.warning("PPO ilustratif dapat memiliki flash point rendah dan komposisi tidak stabil. "
+                   "Simulasi bukan izin/anjuran menguji PPO langsung pada mesin.")
     else:
         ppo_pct=float(st.slider("PPO-M (% volume)",0,100,30,5))
         max_b50=int(100-ppo_pct)
-        b50_pct=float(st.slider("B50 (% volume)",0,max_b50,min(20,max_b50),5)) if max_b50 > 0 else 0.0
-        st.caption(f"Sisa Pertamina Dex = {100-ppo_pct-b50_pct:.0f}% volume; sifat PPO-M ilustratif.")
+        b50_pct=float(st.slider("B50 (% volume)",0,max_b50,min(20,max_b50),5)) if max_b50>0 else 0.0
+        st.caption(f"B0 = {100-ppo_pct-b50_pct:g}% volume (opsi lanjutan V3).")
 
-    with st.expander("Asumsi bahan bakar & mesin (lanjutan)"):
-        lhv0=st.number_input("LHV B0 (MJ/kg) — asumsi",min_value=35.0,max_value=48.0,value=43.0,step=.2)
-        lhv100=st.number_input("LHV B100 (MJ/kg) — asumsi",min_value=32.0,max_value=46.0,value=40.0,step=.2)
-        cn_user=st.checkbox("Tentukan cetane number skenario secara manual",value=False)
-        cn=st.number_input("CN skenario",min_value=25.0,max_value=90.0,value=55.0,step=1.0,
-                           disabled=not cn_user)
-        prmax=st.number_input("Rasio tekanan turbo maksimum (asumsi)",min_value=1.0,
-                              max_value=2.2,value=selected_profile.boost_pr_max_assumed,
-                              step=.05,key=f"boost_pr_{variant}",
-                              help="Nilai 2WD dan 4WD merupakan asumsi model, bukan compressor map/hasil ECU.")
-        intake_c=st.number_input("Temperatur udara masuk lingkungan (°C)",min_value=10,max_value=55,value=32,step=1)
-        soi=st.number_input("Main SOI pada beban 100% (°CA ATDC)",min_value=-25.0,
+    # Setiap editor properti ada di expander terpisah, tanpa nested expander.
+    st.markdown("**✍️ Fuel properties manual**")
+    if manual_components:
+        st.caption("Gunakan data laboratorium; LHV bukan HHV.")
+        f0=fuel_component_editor("Edit properti B0", "b0_v4", DEFAULT_B0)
+        f100=fuel_component_editor("Edit properti B100", "b100_v4", DEFAULT_B100)
+        fppo=fuel_component_editor("Edit properti PPO", "ppo_v4", DEFAULT_PPO)
+    else:
+        f0=f100=fppo=None
+    final_fuel=fuel_component_editor("Edit properti campuran akhir terukur",
+                 "blend_v4",DEFAULT_B0) if manual_final else None
+    with st.expander("Asumsi mesin & injeksi (lanjutan)"):
+        cn_user=st.checkbox("Override CN/proxy campuran skenario",value=False)
+        cn=st.number_input("CN/proxy skenario",min_value=10.0,max_value=100.0,value=55.0,
+                           step=1.0,disabled=not cn_user)
+        prmax=st.number_input("Rasio tekanan turbo maks. (asumsi)",min_value=1.0,
+                              max_value=2.2,value=float(selected_profile.boost_pr_max_assumed),
+                              step=.05,key=f"boost_pr_{variant}")
+        intake_c=st.number_input("Temperatur lingkungan (°C)",min_value=10,max_value=55,value=32,step=1)
+        soi=st.number_input("Main SOI @100% (°CA ATDC)",min_value=-25.0,
                              max_value=10.0,value=-6.0,step=1.0)
-        pilot=st.checkbox("Aktifkan koreksi pilot injection (asumsi)",value=True)
+        pilot=st.checkbox("Koreksi pilot injection (asumsi)",value=True)
     submitted=st.form_submit_button("▶ Jalankan simulasi",type="primary",use_container_width=True)
 
+fuel_scheme=("biodiesel" if blend_mode.startswith("Biodiesel") else
+             "ppo_b0" if blend_mode.startswith("Pirolisis") else "ppo")
 settings=Settings(variant=variant,rpm=int(rpm),load_pct=float(load),b_pct=b_pct,mode=mode,
                   fixed_mg_cycle_cyl=float(fixed_mg),fixed_fuel_kg_h=float(fixed_flow),
-                  lhv_b0=float(lhv0),lhv_b100=float(lhv100),
+                  fixed_volume_mm3_cycle_cyl=float(fixed_vol),
                   cn_override=float(cn) if cn_user else None,
                   pressure_ratio_max=float(prmax),intake_temp_k=float(intake_c)+273.15,
                   soi_deg=float(soi),pilot_enabled=bool(pilot),
-                  fuel_scheme="biodiesel" if blend_mode.startswith("Biodiesel") else "ppo",
-                  ppo_pct=ppo_pct,b50_pct=b50_pct)
+                  fuel_scheme=fuel_scheme,ppo_pct=ppo_pct,b50_pct=b50_pct,
+                  b0_fuel=f0,b100_fuel=f100,ppo_fuel=fppo,
+                  scenario_fuel_override=final_fuel)
 
 if ("sim_result" not in st.session_state or submitted
     or st.session_state["sim_result"]["settings"].variant != variant):
@@ -326,7 +399,7 @@ if ("sim_result" not in st.session_state or submitted
                        "power_kw":scenario["power_kw"],"bte_pct":scenario["bte_pct"],
                        "bsfc_g_kwh":scenario["bsfc_g_kwh"]})
         st.session_state["history"]=hist[:25]
-    except (ValueError,OverflowError,FloatingPointError) as exc:
+    except (ValueError,OverflowError,FloatingPointError,ZeroDivisionError) as exc:
         st.error(f"Simulasi gagal: {exc}")
         st.stop()
 
@@ -345,7 +418,7 @@ st.markdown(f"""
   <p>Simulasi interaktif Toyota 2KD-FTV {active_profile.label}:
      {active_profile.rated_power_kw:g} kW @ {active_profile.rated_rpm:,} rpm, tanpa machine learning.</p>
   <div class="hero-tags"><span>{active_profile.label}</span><span>4 silinder · 2.494 cc</span>
-    <span>CR 18,5:1</span><span>Heun RK2</span><span>B0–B100</span><span>Cloud V3.1 · Dual Variant</span></div>
+    <span>CR 18,5:1</span><span>Heun RK2</span><span>B0–B100</span><span>P0–P100</span><span>Mode 5</span><span>Cloud V4 · Dual Variant</span></div>
 </div>
 """,unsafe_allow_html=True)
 if actual != settings:
@@ -357,7 +430,8 @@ st.markdown(f"""<div class="appnote"><strong>Skenario:</strong> {sc['series']} �
  'Torsi target per RPM':'fixed_torque',
  'Injeksi skenario sama dengan B0 per RPM':'fixed_injection',
  'Massa injeksi sama untuk semua RPM':'fixed_mass_cycle',
- 'Laju bahan bakar sama untuk semua RPM':'fixed_fuel_flow'
+ 'Laju bahan bakar sama untuk semua RPM':'fixed_fuel_flow',
+ 'Volume injeksi sama untuk semua RPM':'fixed_volume_cycle'
 }.items() if value==actual.mode),'mode tak dikenal')}</strong>.
 Hasil ini adalah <strong>estimasi model</strong>, belum dikalibrasi penuh dengan mesin aktual.</div>""",unsafe_allow_html=True)
 
@@ -372,6 +446,11 @@ with tabs[0]:
              fmt(sc["power_kw"]-ref["power_kw"],"kW"))
     c.metric("BSFC model",fmt(sc["bsfc_g_kwh"],"g/kWh"))
     d.metric("BTE model",fmt(sc["bte_pct"],"%"))
+    a,b,c,d=st.columns(4)
+    a.metric("Laju massa bahan bakar",fmt(sc["fuel_kg_h"],"kg/jam"))
+    b.metric("Laju volume bahan bakar",fmt(sc["fuel_l_h"],"L/jam"))
+    c.metric("Energi kimia masuk",fmt(sc["fuel_chemical_kw"],"kW"))
+    d.metric("Volume injeksi",fmt(sc["fuel_volume_mm3_cycle_cyl"],"mm³/siklus/sil."))
     a,b,c,d=st.columns(4)
     a.metric("BMEP model",fmt(sc["bmep_bar"],"bar"))
     b.metric("Puncak tekanan",fmt(sc["pmax_bar"],"bar"))
@@ -402,6 +481,9 @@ with tabs[1]:
     col1,col2=st.columns(2)
     with col1: st.plotly_chart(line_chart(frame,"fuel_kg_h","Konsumsi bahan bakar MODEL","kg/jam"),use_container_width=True)
     with col2: st.plotly_chart(line_chart(frame,"bmep_bar","BMEP model","bar"),use_container_width=True)
+    col1,col2=st.columns(2)
+    with col1: st.plotly_chart(line_chart(frame,"fuel_l_h","Laju VOLUME bahan bakar (model)","L/jam"),use_container_width=True)
+    with col2: st.plotly_chart(line_chart(frame,"fuel_chemical_kw","Energi kimia masuk (model)","kW"),use_container_width=True)
     st.info(f"**Profil {active_profile.label}:** rating Toyota "
             f"**{active_profile.rated_power_kw:g} kW pada {active_profile.rated_rpm:,} rpm**; "
             f"torsi maksimum {active_profile.max_torque_nm:g} Nm pada "
@@ -421,6 +503,9 @@ with tabs[1]:
     c1,c2=st.columns(2)
     with c1: st.plotly_chart(line_chart(frame,"fuel_mg_cycle_cyl","Massa per siklus per silinder","mg/siklus/silinder"),use_container_width=True)
     with c2: st.plotly_chart(line_chart(frame,"fuel_kg_h","Laju massa total mesin (hasil model)","kg/jam"),use_container_width=True)
+    c1,c2=st.columns(2)
+    with c1: st.plotly_chart(line_chart(frame,"fuel_volume_mm3_cycle_cyl","Volume injeksi per siklus","mm³/siklus/silinder"),use_container_width=True)
+    with c2: st.plotly_chart(line_chart(frame,"fuel_l_h","Laju volume total mesin","L/jam"),use_container_width=True)
     capped=frame[frame["fuel_capped_by_air"]==True]  # noqa: E712
     exceeds=frame[frame["above_rated_torque"]==True]  # noqa: E712
     if len(exceeds):
@@ -433,11 +518,15 @@ with tabs[1]:
         st.info("**Skenario = B0 di masing-masing RPM:** jumlah injeksi B0 disetel ulang untuk setiap RPM agar mencapai torsi target; B50 menggunakan jumlah yang sama pada RPM tersebut. Karena itu massa injeksi TIDAK konstan sepanjang sweep RPM.")
     elif actual.mode=='fixed_mass_cycle':
         st.info(f"**Massa injeksi benar-benar konstan:** target {actual.fixed_mg_cycle_cyl:g} mg/siklus/silinder pada seluruh RPM untuk kedua bahan bakar. Jika tidak dibatasi udara, laju massa bahan bakar naik sebanding RPM. Setelan boost masih ditentukan oleh parameter beban, bukan ECU aktual.")
-    else:
+    elif actual.mode=='fixed_fuel_flow':
         st.info(f"**Laju bahan bakar benar-benar konstan:** target {actual.fixed_fuel_kg_h:g} kg/jam pada seluruh RPM untuk kedua bahan bakar. Massa per siklus turun ~1/RPM. Jika dibatasi udara, target aliran tidak akan tercapai pada beberapa titik.")
+    else:
+        st.info(f"**Mode 5 — Volume konstan:** {actual.fixed_volume_mm3_cycle_cyl:g} mm³/siklus/silinder untuk kedua bahan bakar. Massa injeksi berbeda jika densitas berbeda. Volume aktual dapat turun ketika model menerapkan batas udara.")
     st.caption("Rentang data PNM berhenti pada 2.250 rpm dan identitas varian PNM belum dipastikan. Titik model menggunakan profil 2WD/4WD terpilih beserta asumsi matematis masing-masing.")
     st.subheader("Tabel audit hasil versus envelope")
-    audit_cols=["variant","series","rpm","torque_nm","power_kw","rated_torque_nm","rated_power_kw","fuel_mg_cycle_cyl","requested_fuel_mg_cycle_cyl","fuel_kg_h","requested_fuel_kg_h","fuel_capped_by_air","above_rated_torque","outside_pnm_rpm","above_rated_rpm","limited"]
+    audit_cols=["variant","series","rpm","torque_nm","power_kw","rated_torque_nm","rated_power_kw","fuel_mg_cycle_cyl","requested_fuel_mg_cycle_cyl","fuel_volume_mm3_cycle_cyl",
+                "requested_fuel_volume_mm3_cycle_cyl","fuel_kg_h","requested_fuel_kg_h",
+                "fuel_l_h","fuel_chemical_kw","fuel_density_kg_m3","fuel_capped_by_air","above_rated_torque","outside_pnm_rpm","above_rated_rpm","limited"]
     st.dataframe(frame[audit_cols].round(3),hide_index=True,use_container_width=True)
 
 with tabs[2]:
@@ -501,7 +590,15 @@ with tabs[4]:
            "C_pct":"C (% massa) — asumsi", "H_pct":"H (% massa) — asumsi", "O_pct":"O (% massa) — asumsi"}
     dfprop=pd.DataFrame([{"Sifat":units[k],"Nilai":props.get(k)} for k in units])
     st.dataframe(dfprop,hide_index=True,use_container_width=True)
-    st.caption(f"Basis: {props.get('origin','—')} · CN: {props.get('cetane_proxy_basis','—')}")
+    st.caption(f"**Resep:** {props.get('recipe','—')} · Basis: {props.get('origin','—')} · "
+               f"CN: {props.get('cetane_proxy_basis','—')}")
+    st.subheader("Perbandingan properti B0 referensi dengan skenario")
+    ref_props=ref['fuel_properties']
+    st.dataframe(pd.DataFrame([{'Parameter':units[k], 'B0 referensi':ref_props.get(k),
+                               'Skenario':props.get(k)} for k in units]),
+                 hide_index=True,use_container_width=True)
+    st.caption("Jika memakai input properti campuran akhir hasil laboratorium, nilai manual "
+               "menggantikan hasil mixing rules. Properti manual tersimpan selama sesi ini saja.")
     st.subheader("Tabel sumber fuel properties dari penelitian lain")
     fd=pd.DataFrame([{"Biodiesel (%)":k,"Density @15°C (kg/m³)":v["density"],
                   "Viscosity @40°C (mm²/s)":v["viscosity"],
@@ -513,8 +610,28 @@ with tabs[4]:
 
 with tabs[5]:
     st.subheader("Ekspor hasil simulasi")
+    st.caption("Properti manual dalam sesi browser tidak disimpan di server. "
+               "Unduh file di bawah untuk dokumentasi dan reproduksibilitas skenario.")
+    fuel_rows=[]
+    for label,item in (("B0",actual.b0_fuel or DEFAULT_B0),
+                       ("B100",actual.b100_fuel or DEFAULT_B100),
+                       ("PPO",actual.ppo_fuel or DEFAULT_PPO),
+                       ("Campuran akhir (hasil model)",None),
+                       ("Campuran akhir (manual)",actual.scenario_fuel_override)):
+        if item is not None:
+            fuel_rows.append({"Komponen":label,**vars(item)})
+        elif label.startswith("Campuran akhir (hasil"):
+            fuel_rows.append({"Komponen":label,
+                **{k:props.get(v) for k,v in {
+                    'density_kg_m3':'density_kg_m3',
+                    'viscosity_cst':'viscosity_cst','lhv_mj_kg':'lhv_mj_kg',
+                    'cetane_proxy':'cetane_proxy','flash_c':'flash_c',
+                    'C_pct':'C_pct','H_pct':'H_pct','O_pct':'O_pct'}.items()}})
+    st.download_button("⬇ Unduh properti bahan bakar skenario (CSV)",
+        data=csv_bytes(pd.DataFrame(fuel_rows)),
+        file_name=f"fuel_properties_2KD_FTV_{actual.variant}_V4.csv",mime="text/csv")
     st.download_button("⬇ Unduh ringkasan seluruh RPM (CSV)",
-        data=csv_bytes(frame),file_name=f"simulasi_2KD_FTV_{actual.variant}_V3.csv",mime="text/csv")
+        data=csv_bytes(frame),file_name=f"simulasi_2KD_FTV_{actual.variant}_V4.csv",mime="text/csv")
     tr=pd.DataFrame(sc["trace"])
     st.download_button("⬇ Unduh kurva silinder skenario (CSV)",
         data=csv_bytes(tr),file_name=f"simulasi_2KD_FTV_{actual.variant}_trace.csv",mime="text/csv")
@@ -535,7 +652,9 @@ with tabs[5]:
 - **Profil Engine Variant V3:** 2WD awal = 65 kW @ 3.800 rpm, 192 Nm @ 1.200–3.000 rpm; 4WD awal = 75 kW @ 3.600 rpm, 260 Nm @ 1.600–2.400 rpm. Geometri dan rasio kompresi sama menurut Toyota New Features (hal. 19).
 - **Envelope full load:** nilai di antara plateau torsi dan rating daya dihitung dengan interpolasi linier ASUMSI. Endpoint 1.000 rpm untuk kedua varian serta area 4WD di atas 3.600 rpm juga ASUMSI, bukan titik pengujian; ECU dan sistem turbo masing-masing varian dapat berbeda.
 - **Asumsi boost per varian:** PR maksimum 2WD 1,65 dan 4WD 1,80 hanyalah nilai awal skenario; bisa diubah di sidebar. Bukan peta tekanan boost mesin asli. Tanpa data ECU, pengubahan varian TIDAK otomatis memberikan model turbo/injeksi 4WD yang tervalidasi.
-- **Mode injeksi:** `fixed_injection` lama berarti massa B50 = B0 *pada setiap RPM* (tidak tetap sepanjang sweep); `fixed_mass_cycle` menjaga mg/siklus/silinder; `fixed_fuel_flow` menjaga kg/jam. Ketiga konsep berbeda.
+- **Mode injeksi:** `fixed_injection` menjaga massa skenario sama dengan B0 pada masing-masing RPM; `fixed_mass_cycle` menjaga mg/siklus/silinder; `fixed_fuel_flow` menjaga kg/jam; `fixed_volume_cycle` menjaga mm³/siklus/silinder. Mode volume tetap menghasilkan massa yang berbeda apabila densitas berbeda.
+- **Keluarga campuran:** B0–B100 = campuran B0+B100; P0–P100 = campuran B0+PPO. Persentase memakai basis **volume**; LHV/komposisi unsur dicampur dengan basis massa. Mode PPO+B0+B50 dari V3 dipertahankan sebagai opsi lanjutan.
+- **Fuel properties manual:** komponen B0/B100/PPO dan campuran akhir dapat diisi dari uji laboratorium. Input campuran akhir mengesampingkan aturan pencampuran. PPO default ILUSTRATIF; tidak dapat dijadikan bukti stabilitas, kompatibilitas injektor, atau kelayakan penggunaan pada mesin.
 - **Turbo & pembatasan udara:** fraksi beban di mode fixed-fuel adalah input parameter boost yang belum ditutup dengan umpan balik output aktual. Saat suplai dipotong oleh batas AFR, mode "konstan" tidak lagi tercapai; dashboard memberi peringatan.
 - **Rentang PNM:** hanya 1.250–2.250 rpm. **Identitas varian PNM belum terverifikasi** sehingga tidak diklaim cocok untuk 2WD atau 4WD. Data PNM TIDAK digunakan untuk menghitung kurva simulasi > 2.250 rpm; berlaku asumsi model dan profil rating Toyota yang dipilih. Mencapai titik rating pada mode torsi target BUKAN validasi independen.
 - **Emisi:** NOx dan smoke hanya indeks relatif; CO₂ merupakan batas ideal neraca karbon, bukan emisi tailpipe.
@@ -545,4 +664,4 @@ with tabs[5]:
     st.caption("Referensi utama: J.B. Heywood, Internal Combustion Engine Fundamentals; kode starter PPO-M pengguna; dokumen spesifikasi Toyota 2KD-FTV 2WD awal; data PNM dan tabel fuel properties yang pengguna kirim.")
 
 st.divider()
-st.caption(f"Toyota 2KD-FTV {active_profile.label} · Engine Lab Cloud V3 | Hasil terakhir: {st.session_state.get('run_time','—')} | Non-ML · Streamlit Community Cloud · Penyimpanan hanya selama sesi")
+st.caption(f"Toyota 2KD-FTV {active_profile.label} · Engine Lab Cloud V4 | Hasil terakhir: {st.session_state.get('run_time','—')} | Non-ML · Streamlit Community Cloud · Penyimpanan hanya selama sesi")

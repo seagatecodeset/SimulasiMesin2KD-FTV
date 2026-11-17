@@ -8,9 +8,11 @@ ppo_blend_physics.py milik pengguna (PPO starter, 28 September 2026).
 - LHV default adalah ASUMSI, bukan 'calorific value' tabel yang belum diverifikasi.
 - Cetane *index* tabel sebagai PROXY CN eksploratif, bukan pengukuran CN.
 - Korelasi emisi hanya INDEKS RELATIF, bukan prediksi NOx ppm/FSN terukur.
-- Empat mode: fixed_torque; fixed_injection (sama dengan B0 per RPM);
-  fixed_mass_cycle (massa mg/siklus/silinder konstan); fixed_fuel_flow
-  (laju massa kg/jam konstan). Definisi dan batas model dijelaskan di UI.
+- Lima mode: fixed_torque, fixed_injection, fixed_mass_cycle,
+  fixed_fuel_flow dan fixed_volume_cycle (mm³/siklus/silinder).
+- Dua keluarga skenario utama: B0/B100 dan P0/P100 berbasis B0/PPO.
+- Properti B0, B100, PPO, serta campuran akhir dapat diisi secara manual.
+  PPO ilustratif bukan rekomendasi penggunaan langsung pada kendaraan.
 - RPM > 2250 berasal dari asumsi model & spesifikasi pabrikan; BUKAN
   ekstrapolasi data performa PNM yang hanya tersedia hingga 2250 rpm.
 """
@@ -74,6 +76,96 @@ def get_engine_profile(variant: str = '2wd') -> EngineProfile:
 
 
 @dataclass(frozen=True)
+class FuelComponent:
+    """Sifat komponen pada suhu referensi (density @15°C, viskositas @40°C).
+
+    Cetane adalah CN jika diukur; bila masih berasal dari cetane index,
+    harus ditandai sebagai proxy pada UI. LHV adalah *lower* heating value.
+    """
+    density_kg_m3: float
+    viscosity_cst: float
+    lhv_mj_kg: float
+    cetane_proxy: float
+    flash_c: float
+    C_pct: float
+    H_pct: float
+    O_pct: float
+
+
+# Titik awal: referensi tabel pengguna dan asumsi starter kit (bukan sertifikat kualitas).
+DEFAULT_B0 = FuelComponent(833.1, 4.69, 43.0, 48.0, 61.5, 86.5, 13.5, 0.0)
+DEFAULT_B100 = FuelComponent(875.5, 5.77, 40.0, 67.0, 164.5, 77.0, 12.0, 11.0)
+DEFAULT_PPO = FuelComponent(805.0, 1.70, 43.6, 45.0, 45.0, 86.0, 14.0, 0.0)
+
+
+def validate_fuel(f: FuelComponent, name: str = "bahan bakar") -> None:
+    """Validasi numerik; bukan uji kesesuaian terhadap spesifikasi BBM."""
+    vals = tuple(vars(f).values())
+    if not all(math.isfinite(v) for v in vals):
+        raise ValueError(f"{name}: semua properti harus bernilai finite")
+    if not 500 <= f.density_kg_m3 <= 1200:
+        raise ValueError(f"{name}: density di luar rentang pemeriksaan 500–1200 kg/m³")
+    if not 0.21 <= f.viscosity_cst <= 100:
+        raise ValueError(f"{name}: viskositas di luar rentang pemeriksaan 0,21–100 cSt")
+    if not 15 <= f.lhv_mj_kg <= 55:
+        raise ValueError(f"{name}: LHV di luar rentang pemeriksaan 15–55 MJ/kg")
+    if not 10 <= f.cetane_proxy <= 100:
+        raise ValueError(f"{name}: CN/proxy di luar rentang 10–100")
+    if not -50 <= f.flash_c <= 300:
+        raise ValueError(f"{name}: flash point di luar rentang pemeriksaan")
+    if any(not 0 <= v <= 100 for v in (f.C_pct, f.H_pct, f.O_pct)):
+        raise ValueError(f"{name}: nilai C,H,O harus dalam % massa 0–100")
+    if not 90 <= f.C_pct + f.H_pct + f.O_pct <= 100.01:
+        raise ValueError(f"{name}: jumlah C+H+O harus 90–100% massa; sisanya boleh N/S/abu")
+
+
+def component_as_properties(f: FuelComponent, origin: str) -> dict:
+    validate_fuel(f, origin)
+    afr = (11.48*f.C_pct + 34.34*f.H_pct - 4.3*f.O_pct)/100
+    if afr <= 0:
+        raise ValueError('AFR stoikiometrik tidak valid')
+    return dict(density_kg_m3=f.density_kg_m3, viscosity_cst=f.viscosity_cst,
+                lhv_mj_kg=f.lhv_mj_kg, cetane_proxy=f.cetane_proxy,
+                flash_c=f.flash_c, C_pct=f.C_pct, H_pct=f.H_pct,
+                O_pct=f.O_pct, afr_st=afr, origin=origin,
+                cetane_proxy_basis='CN / proxy sesuai masukan')
+
+
+def mix_fuels(components: list[FuelComponent], volume_fractions: list[float],
+              origin: str) -> dict:
+    """Mixing: rho basis volume; LHV/C/H/O basis massa; Refutas viskositas.
+    CN diaproksimasi linier berdasar volume; flash bukan jaminan keselamatan.
+    """
+    for i, f in enumerate(components):
+        validate_fuel(f, f'komponen {i+1}')
+    v=np.asarray(volume_fractions, dtype=float)
+    if len(components)!=len(v) or np.any(v < 0) or not np.isfinite(v).all() or abs(float(v.sum())-1)>1e-8:
+        raise ValueError('Fraksi volume harus nonnegatif dan total 100%.')
+    if sum(v > 1e-12)==1:
+        idx=int(np.argmax(v))
+        return component_as_properties(components[idx], origin)
+    rho=np.array([f.density_kg_m3 for f in components])
+    density=float(v@rho)
+    w=v*rho/density
+    lhv=float(w@np.array([f.lhv_mj_kg for f in components]))
+    C,H,O=[float(w@np.array([getattr(f,k+'_pct') for f in components])) for k in ('C','H','O')]
+    visc=float(math.exp(math.exp((w@np.array([_vbn(f.viscosity_cst) for f in components])-10.975)/14.534))-.8)
+    CN=float(v@np.array([f.cetane_proxy for f in components]))
+    # Wickey–Chittenden pendekatan prediksi flash; bukan nilai flash point terukur.
+    TF=np.array([f.flash_c*9/5+32 for f in components])
+    bi=10**(-6.1188+2414/(TF+230.56))
+    mix_b=float(v@bi)
+    flashF=2414/(math.log10(mix_b)+6.1188)-230.56
+    flash=(flashF-32)*5/9
+    afr_st=(11.48*C+34.34*H-4.3*O)/100
+    return dict(density_kg_m3=density,viscosity_cst=visc,lhv_mj_kg=lhv,
+                cetane_proxy=CN,flash_c=float(flash),C_pct=C,H_pct=H,O_pct=O,
+                afr_st=afr_st,origin=origin,
+                cetane_proxy_basis='interpolasi fraksi volume; hanya proxy',
+                mass_fractions=tuple(map(float,w)))
+
+
+@dataclass(frozen=True)
 class Settings:
     variant: str = "2wd"
     rpm: int = 2000
@@ -82,6 +174,7 @@ class Settings:
     mode: str = "fixed_torque"  # fixed_torque | fixed_injection | fixed_mass_cycle | fixed_fuel_flow
     fixed_mg_cycle_cyl: float = 30.0  # mg/injection-cycle/cylinder, BOTH fuels, all RPM
     fixed_fuel_kg_h: float = 9.0      # kg/h total engine, BOTH fuels, all RPM
+    fixed_volume_mm3_cycle_cyl: float = 30.0  # mm³/siklus/silinder, sama kedua bahan bakar
     lhv_b0: float = 43.0   # ASUMSI sementara MJ/kg
     lhv_b100: float = 40.0 # ASUMSI sementara MJ/kg
     cn_override: float | None = None
@@ -91,7 +184,11 @@ class Settings:
     pilot_enabled: bool = True        # strategi pilot ASSUMSI, verifikasi ECU
     fuel_scheme: str = 'biodiesel'     # biodiesel | ppo
     ppo_pct: float = 0.0              # untuk scheme=ppo
-    b50_pct: float = 0.0              # sisa dari 100% adalah Pertamina Dex (B0)
+    b50_pct: float = 0.0              # legacy: sisa volume = B0 (mode PPO+B0+B50)
+    b0_fuel: FuelComponent | None = None
+    b100_fuel: FuelComponent | None = None
+    ppo_fuel: FuelComponent | None = None
+    scenario_fuel_override: FuelComponent | None = None  # properti campuran akhir terukur
 
 
 def _vbn(v: float) -> float:
@@ -99,79 +196,100 @@ def _vbn(v: float) -> float:
 
 
 def fuel_properties(b_pct: float, lhv_b0: float = 43., lhv_b100: float = 40.,
-                    cn_override: float | None = None) -> dict:
-    """Campur B0/B100 berdasarkan volume; parameter referensi exact dipakai apa adanya.
-    Density = linear volume; LHV dan unsur = linear mass; viscosity = Refutas.
-    Cetane index diinterpolasi piecewise dari literatur, sebagai proxy CN eksploratif.
+                    cn_override: float | None = None,
+                    b0_fuel: FuelComponent | None = None,
+                    b100_fuel: FuelComponent | None = None) -> dict:
+    """B0+B100 campuran fraksi VOLUME, end-member bisa diisi manual.
+
+    Bila tidak ada input manual, titik 0/50/55/100 dari tabel literatur
+    dipertahankan untuk kompatibilitas V3; LHV tidak diambil dari calorific
+    value literatur yang basis HHV/LHV-nya belum jelas. Perubahan input manual
+    menggunakan mixing rules pada semua konsentrasi sehingga hasil berubah.
     """
     if not 0 <= b_pct <= 100:
-        raise ValueError("Persen biodiesel harus 0-100.")
-    x = b_pct / 100
-    rho0, rho100 = REFERENCE_FUELS[0]['density'], REFERENCE_FUELS[100]['density']
-    density = (1 - x) * rho0 + x * rho100
-    mass_b100 = x * rho100 / density
-    lhv = (1 - mass_b100) * lhv_b0 + mass_b100 * lhv_b100
-    viscosity = math.exp(math.exp(( (1-mass_b100)*_vbn(4.69) + mass_b100*_vbn(5.77) - 10.975)/14.534))-.8
-    points = np.array(sorted(REFERENCE_FUELS))
-    ci = float(np.interp(b_pct, points, [REFERENCE_FUELS[int(p)]['ci'] for p in points]))
-    flash = float(np.interp(b_pct, points, [REFERENCE_FUELS[int(p)]['flash'] for p in points]))
-    source = 'mixing_rules + literatur CI' 
-    # Tepat pada komposisi yang dilaporkan, pakai pengukuran densitas/visko tabel.
-    for k in REFERENCE_FUELS:
-        if abs(b_pct-k)<1e-9:
-            density = REFERENCE_FUELS[k]['density']
-            viscosity = REFERENCE_FUELS[k]['viscosity']
-            flash = REFERENCE_FUELS[k]['flash']
-            source = 'sifat fisik literatur; LHV provisional'
-    C = (1-mass_b100)*86.5 + mass_b100*77.0  # persen massa ASUMSI
-    H = (1-mass_b100)*13.5 + mass_b100*12.0
-    O = (1-mass_b100)*0.0 + mass_b100*11.0
-    afr_st = 11.48*C/100 + 34.34*H/100 - 4.3*O/100
-    return dict(b_pct=b_pct, density_kg_m3=density, viscosity_cst=viscosity,
-                lhv_mj_kg=lhv, cetane_proxy=float(cn_override) if cn_override is not None else ci,
-                cetane_proxy_basis='override pengguna' if cn_override is not None else 'proxy cetane index literatur',
-                reported_calorific_mj_kg=REFERENCE_FUELS[int(b_pct)]['calorific_reported'] if b_pct in REFERENCE_FUELS else None,
-                flash_c=flash, C_pct=C, H_pct=H, O_pct=O, afr_st=afr_st, origin=source)
+        raise ValueError('Biodiesel B harus 0–100% volume')
+    f0=b0_fuel or FuelComponent(*[DEFAULT_B0.density_kg_m3,DEFAULT_B0.viscosity_cst,
+                                  lhv_b0,DEFAULT_B0.cetane_proxy,DEFAULT_B0.flash_c,
+                                  DEFAULT_B0.C_pct,DEFAULT_B0.H_pct,DEFAULT_B0.O_pct])
+    f100=b100_fuel or FuelComponent(DEFAULT_B100.density_kg_m3,DEFAULT_B100.viscosity_cst,
+                                    lhv_b100,DEFAULT_B100.cetane_proxy,DEFAULT_B100.flash_c,
+                                    DEFAULT_B100.C_pct,DEFAULT_B100.H_pct,DEFAULT_B100.O_pct)
+    result=mix_fuels([f0,f100],[1-b_pct/100,b_pct/100],
+                     'B0+B100: aturan pencampuran komponen')
+    result['b_pct']=float(b_pct)
+    result['p_pct']=0.0
+    result['recipe']=f'B{b_pct:g} = {100-b_pct:g}%vol B0 + {b_pct:g}%vol B100'
+    result['reported_calorific_mj_kg']=None
+    # Historical output default preserved: tabel B0/B50/B55/B100 dari sumber literatur.
+    using_reference=(b0_fuel is None or b0_fuel==DEFAULT_B0) and (b100_fuel is None or b100_fuel==DEFAULT_B100)
+    if using_reference and b_pct in REFERENCE_FUELS:
+        ref=REFERENCE_FUELS[int(b_pct)]
+        result.update(density_kg_m3=ref['density'],viscosity_cst=ref['viscosity'],
+                      cetane_proxy=float(ref['ci']),flash_c=ref['flash'],
+                      reported_calorific_mj_kg=ref['calorific_reported'],
+                      origin='sifat fisik tabel penelitian lain; LHV asumsi model',
+                      cetane_proxy_basis='cetane index penelitian lain (proxy)')
+    if cn_override is not None:
+        result['cetane_proxy']=float(cn_override)
+        result['cetane_proxy_basis']='override CN/proxy pengguna'
+    return result
+
+
+def ppo_b0_properties(ppo_pct:float,lhv_b0:float,lhv_b100:float,
+                      cn_override:float|None=None,
+                      b0_fuel:FuelComponent|None=None,
+                      ppo_fuel:FuelComponent|None=None) -> dict:
+    """Campuran P0..P100 = B0 + PPO, basis % volume.
+
+    PPO bukan jenis tunggal bahan bakar; data manual sebaiknya berasal dari
+    sampel laboratorium. Default PPO hanya contoh starter pengguna.
+    """
+    if not 0 <= ppo_pct <= 100:
+        raise ValueError('PPO P harus 0–100% volume')
+    f0=b0_fuel or FuelComponent(DEFAULT_B0.density_kg_m3,DEFAULT_B0.viscosity_cst,
+                                 lhv_b0,DEFAULT_B0.cetane_proxy,DEFAULT_B0.flash_c,
+                                 DEFAULT_B0.C_pct,DEFAULT_B0.H_pct,DEFAULT_B0.O_pct)
+    ppo=ppo_fuel or DEFAULT_PPO
+    result=mix_fuels([f0,ppo],[1-ppo_pct/100,ppo_pct/100],
+                     'PPO+B0: aturan campuran; PPO default ilustratif' if ppo_fuel is None
+                     else 'PPO+B0: masukan properti komponen')
+    result.update(b_pct=0.0,p_pct=float(ppo_pct),
+                  recipe=f'P{ppo_pct:g} = {100-ppo_pct:g}%vol B0 + {ppo_pct:g}%vol PPO',
+                  reported_calorific_mj_kg=None)
+    if cn_override is not None:
+        result['cetane_proxy']=float(cn_override)
+        result['cetane_proxy_basis']='override CN/proxy pengguna'
+    return result
 
 
 def ppo_recipe_properties(ppo_pct:float,b50_pct:float,lhv_b0:float,lhv_b100:float,
-                          cn_override:float|None=None) -> dict:
-    """PPO-M/Dex/B50: properti PPO-M ILUSTRATIF dari starter kit pengguna.
-    Komposisi dinyatakan %volume dan disyaratkan jumlah 100. Ini BUKAN
-    formulasi tervalidasi/aman untuk dipakai langsung pada kendaraan.
-    """
+                          cn_override:float|None=None,
+                          b0_fuel:FuelComponent|None=None,
+                          b100_fuel:FuelComponent|None=None,
+                          ppo_fuel:FuelComponent|None=None) -> dict:
+    """Mode PPO + B0 + B50 V3 (opsi lanjutan) tetap tersedia."""
     if ppo_pct<0 or b50_pct<0 or ppo_pct+b50_pct>100:
-        raise ValueError('PPO + B50 harus <= 100%, Dex adalah sisanya.')
-    x1=ppo_pct/100
-    x3=b50_pct/100
-    x2=1-x1-x3
-    b0=fuel_properties(0,lhv_b0,lhv_b100)
-    b50=fuel_properties(50,lhv_b0,lhv_b100)
-    # PPO-M sumber: kode contoh pengguna, nilai ilustratif, bukan hasil uji lab.
-    ppo=dict(density_kg_m3=805.,lhv_mj_kg=43.6,viscosity_cst=1.70,
-             cetane_proxy=45.,flash_c=45.,C_pct=86.,H_pct=14.,O_pct=0.)
-    comps=[ppo,b0,b50]
-    v=np.array([x1,x2,x3],dtype=float)
-    rho=np.array([p['density_kg_m3'] for p in comps])
-    density=float(v@rho)
-    w=v*rho/density
-    LHV=float(w@np.array([p['lhv_mj_kg'] for p in comps]))
-    C,H,O=[float(w@np.array([p[k+'_pct'] for p in comps])) for k in ('C','H','O')]
-    visc=float(math.exp(math.exp((w@np.array([_vbn(p['viscosity_cst']) for p in comps])-10.975)/14.534))-.8)
-    CI=float(v@np.array([p['cetane_proxy'] for p in comps]))
-    # Wickey-Chittenden: eksperimental blend flash, berlaku sebagai estimasi saja.
-    TF=np.array([p['flash_c']*9/5+32 for p in comps])
-    bi=10**(-6.1188+2414/(TF+230.56))
-    flashF=2414/(math.log10(float(v@bi))+6.1188)-230.56
-    flash=(flashF-32)*5/9
-    afr_st=11.48*C/100+34.34*H/100-4.3*O/100
-    return dict(b_pct=50*x3,density_kg_m3=density,viscosity_cst=visc,
-         lhv_mj_kg=LHV,cetane_proxy=float(cn_override) if cn_override is not None else CI,
-         cetane_proxy_basis='override pengguna' if cn_override is not None else 'proxy CI + PPO-M ilustratif',
-         reported_calorific_mj_kg=None, flash_c=flash,C_pct=C,H_pct=H,O_pct=O,
-         afr_st=afr_st,origin='campuran PPO-M ilustratif; B0/B50 literatur',
-         recipe=f'PPO-M {ppo_pct:g}% + Dex {100-ppo_pct-b50_pct:g}% + B50 {b50_pct:g}%')
-
+        raise ValueError('PPO + B50 harus <= 100%, sisanya B0')
+    f0=b0_fuel or FuelComponent(DEFAULT_B0.density_kg_m3,DEFAULT_B0.viscosity_cst,
+                                 lhv_b0,DEFAULT_B0.cetane_proxy,DEFAULT_B0.flash_c,
+                                 DEFAULT_B0.C_pct,DEFAULT_B0.H_pct,DEFAULT_B0.O_pct)
+    f100=b100_fuel or FuelComponent(DEFAULT_B100.density_kg_m3,DEFAULT_B100.viscosity_cst,
+                                     lhv_b100,DEFAULT_B100.cetane_proxy,DEFAULT_B100.flash_c,
+                                     DEFAULT_B100.C_pct,DEFAULT_B100.H_pct,DEFAULT_B100.O_pct)
+    fppo=ppo_fuel or DEFAULT_PPO
+    # B50 diwakili oleh properti hasil pencampuran B0+B100; bukan nilai bahan murni.
+    b50=fuel_properties(50,lhv_b0,lhv_b100,b0_fuel=f0,b100_fuel=f100)
+    f50=FuelComponent(b50['density_kg_m3'],b50['viscosity_cst'],b50['lhv_mj_kg'],
+                      b50['cetane_proxy'],b50['flash_c'],b50['C_pct'],b50['H_pct'],b50['O_pct'])
+    result=mix_fuels([fppo,f0,f50],[ppo_pct/100,(100-ppo_pct-b50_pct)/100,b50_pct/100],
+                     'PPO+B0+B50: pendekatan model (opsi lanjutan)')
+    result.update(b_pct=float(0.5*b50_pct), p_pct=float(ppo_pct),
+                  reported_calorific_mj_kg=None,
+                  recipe=f'PPO {ppo_pct:g}% + B0 {100-ppo_pct-b50_pct:g}% + B50 {b50_pct:g}% volume')
+    if cn_override is not None:
+        result['cetane_proxy']=float(cn_override)
+        result['cetane_proxy_basis']='override CN/proxy pengguna'
+    return result
 
 @lru_cache(maxsize=1)
 def geometry():
@@ -237,13 +355,31 @@ def simulate_cycle(settings: Settings, b_pct: float, rpm: float, m_f_fixed: floa
     """Jalankan kasus steady-state; bila m_f_fixed=None, iterasi untuk torque target.
     Output berupa angka per silinder dan trace sudut engkol yang konsisten.
     """
-    if recipe and settings.fuel_scheme=='ppo':
+    if recipe and settings.fuel_scheme=='ppo_b0':
+        prop=ppo_b0_properties(settings.ppo_pct,settings.lhv_b0,settings.lhv_b100,
+                               settings.cn_override,settings.b0_fuel,settings.ppo_fuel)
+        b_pct=prop['b_pct']
+    elif recipe and settings.fuel_scheme=='ppo':
         prop=ppo_recipe_properties(settings.ppo_pct,settings.b50_pct,
-                                   settings.lhv_b0,settings.lhv_b100,settings.cn_override)
-        b_pct=prop['b_pct']  # fraksi biodiesel efektif di bahan bakar (bukan PPO).
+                                   settings.lhv_b0,settings.lhv_b100,settings.cn_override,
+                                   settings.b0_fuel,settings.b100_fuel,settings.ppo_fuel)
+        b_pct=prop['b_pct']
     else:
-        prop = fuel_properties(b_pct, settings.lhv_b0, settings.lhv_b100,
-                               settings.cn_override if b_pct != 0 else None)
+        prop=fuel_properties(b_pct,settings.lhv_b0,settings.lhv_b100,
+                             settings.cn_override if recipe and b_pct != 0 else None,
+                             settings.b0_fuel,settings.b100_fuel)
+    if recipe and settings.scenario_fuel_override is not None:
+        # Nilai terukur campuran akhir, bukan mixing rule; b_pct/p_pct tetap hanya label.
+        manual=component_as_properties(settings.scenario_fuel_override,
+                                       'properti campuran akhir manual (diutamakan)')
+        prop.update(manual)
+        prop['reported_calorific_mj_kg']=None
+        prop['manual_final_blend']=True
+        prop['cetane_proxy_basis']='CN / proxy campuran akhir dari input manual'
+        if settings.cn_override is not None:
+            prop['cetane_proxy']=float(settings.cn_override)
+            prop['cetane_proxy_basis']='override CN dari kotak lanjutan'
+
     profile = get_engine_profile(settings.variant)
     n = float(rpm)
     t_target = full_load_torque(n, settings.variant) * settings.load_pct/100
@@ -345,6 +481,9 @@ def simulate_cycle(settings: Settings, b_pct: float, rpm: float, m_f_fixed: floa
     torque=bmep*1e5*V_TOTAL/(4*math.pi)
     power_kw=torque*2*math.pi*n/60/1000
     fuel_kg_h=mf*N_CYL*n/120*3600
+    fuel_l_h=fuel_kg_h*1000/prop['density_kg_m3']
+    fuel_volume_mm3_cycle_cyl=mf/prop['density_kg_m3']*1e9
+    fuel_chemical_kw=fuel_kg_h*prop['lhv_mj_kg']/3.6
     bsfc=fuel_kg_h*1000/power_kw if power_kw>1e-5 else None
     bte=power_kw/(fuel_kg_h/3600*prop['lhv_mj_kg']*1000) if power_kw>0 else None
     lam=m_air/(mf*prop['afr_st'])
@@ -360,7 +499,10 @@ def simulate_cycle(settings: Settings, b_pct: float, rpm: float, m_f_fixed: floa
         'variant':settings.variant, 'engine_profile':profile.label,
         'rpm':int(n), 'fuel_pct':float(b_pct),'torque_nm':float(torque),'power_kw':float(power_kw),
         'bmep_bar':float(bmep),'target_bmep_bar':float(bmep_target),'imep_bar':float(r['imep']),
-        'fmep_bar':float(r['fmep']),'fuel_kg_h':float(fuel_kg_h), 'fuel_mg_cycle_cyl':float(mf*1e6),
+        'fmep_bar':float(r['fmep']),'fuel_kg_h':float(fuel_kg_h),
+        'fuel_l_h':float(fuel_l_h),'fuel_chemical_kw':float(fuel_chemical_kw),
+        'fuel_volume_mm3_cycle_cyl':float(fuel_volume_mm3_cycle_cyl),
+        'fuel_mg_cycle_cyl':float(mf*1e6),
         'requested_fuel_mg_cycle_cyl':float(requested_mf*1e6) if requested_mf is not None else None,
         'air_fuel_limit_mg_cycle_cyl':float(max_fuel*1e6),
         'requested_fuel_kg_h':float(requested_mf*N_CYL*n/120*3600) if requested_mf is not None else None,
@@ -376,6 +518,9 @@ def simulate_cycle(settings: Settings, b_pct: float, rpm: float, m_f_fixed: floa
         'turbo_pr_assumed':float(PR), 'turbo_pr_max_setting':float(pr_max),
         'fuel_lhv_mj_kg':float(prop['lhv_mj_kg']),
         'fuel_density_kg_m3':float(prop['density_kg_m3']),
+        'fuel_family':settings.fuel_scheme if recipe else 'reference_b0',
+        'fuel_p_pct':float(prop.get('p_pct',0.0)),
+        'fuel_recipe':prop.get('recipe','B0 referensi'),
         'fuel_viscosity_cst':float(prop['viscosity_cst']),
         'cetane_proxy':float(prop['cetane_proxy']),
         'limited':bool(capped or abs(torque-t_target)/max(t_target,1)>.03) if m_f_fixed is None else bool(capped),
@@ -392,13 +537,15 @@ def simulate_cycle(settings: Settings, b_pct: float, rpm: float, m_f_fixed: floa
 
 def run_sweep(settings: Settings) -> dict:
     profile = get_engine_profile(settings.variant)
-    if settings.mode not in ('fixed_torque','fixed_injection','fixed_mass_cycle','fixed_fuel_flow'):
+    if settings.mode not in ('fixed_torque','fixed_injection','fixed_mass_cycle','fixed_fuel_flow','fixed_volume_cycle'):
         raise ValueError('mode tidak dikenal')
     if settings.mode=='fixed_mass_cycle' and not (0 < settings.fixed_mg_cycle_cyl <= 100):
         raise ValueError('Injeksi konstan harus 0 < mg/siklus/silinder <= 100')
     if settings.mode=='fixed_fuel_flow' and not (0 < settings.fixed_fuel_kg_h <= 100):
         raise ValueError('Laju bahan bakar konstan harus 0 < kg/jam <= 100')
-    if settings.fuel_scheme not in ('biodiesel','ppo'):
+    if settings.mode=='fixed_volume_cycle' and not (0 < settings.fixed_volume_mm3_cycle_cyl <= 150):
+        raise ValueError('Volume injeksi konstan harus 0 < mm³/siklus/silinder <= 150')
+    if settings.fuel_scheme not in ('biodiesel','ppo','ppo_b0'):
         raise ValueError('Jenis campuran tidak dikenal')
     if settings.fuel_scheme=='ppo' and settings.ppo_pct+settings.b50_pct>100:
         raise ValueError('PPO + B50 tidak boleh lebih dari 100%.')
@@ -417,21 +564,41 @@ def run_sweep(settings: Settings) -> dict:
         # fixed_mass_cycle: kedua bahan bakar menerima mg/cycle/cyl konstan.
         # fixed_fuel_flow: kedua bahan bakar menerima kg/h konstan;
         #                  mg/cycle/cyl turun ketika RPM naik.
-        if settings.mode=='fixed_mass_cycle':
+        if settings.mode=='fixed_volume_cycle':
+            volume_m3=settings.fixed_volume_mm3_cycle_cyl*1e-9
+            b0_prop=fuel_properties(0,settings.lhv_b0,settings.lhv_b100,
+                                    b0_fuel=settings.b0_fuel,b100_fuel=settings.b100_fuel)
+            if settings.fuel_scheme=='ppo_b0':
+                scenario_prop=ppo_b0_properties(settings.ppo_pct,settings.lhv_b0,settings.lhv_b100,
+                                                settings.cn_override,settings.b0_fuel,settings.ppo_fuel)
+            elif settings.fuel_scheme=='ppo':
+                scenario_prop=ppo_recipe_properties(settings.ppo_pct,settings.b50_pct,
+                                                    settings.lhv_b0,settings.lhv_b100,
+                                                    settings.cn_override,settings.b0_fuel,
+                                                    settings.b100_fuel,settings.ppo_fuel)
+            else:
+                scenario_prop=fuel_properties(settings.b_pct,settings.lhv_b0,settings.lhv_b100,
+                                               settings.cn_override,settings.b0_fuel,settings.b100_fuel)
+            if settings.scenario_fuel_override is not None:
+                scenario_prop['density_kg_m3']=settings.scenario_fuel_override.density_kg_m3
+            reference=simulate_cycle(settings,0,rpm,m_f_fixed=volume_m3*b0_prop['density_kg_m3'])
+            scenario=simulate_cycle(settings,settings.b_pct,rpm,
+                                    m_f_fixed=volume_m3*scenario_prop['density_kg_m3'],recipe=True)
+        elif settings.mode=='fixed_mass_cycle':
             mf_spec=settings.fixed_mg_cycle_cyl*1e-6
             reference=simulate_cycle(settings,0,rpm,m_f_fixed=mf_spec)
             scenario=simulate_cycle(settings,settings.b_pct,rpm,m_f_fixed=mf_spec,
-                                    recipe=settings.fuel_scheme=='ppo')
+                                    recipe=True)
         elif settings.mode=='fixed_fuel_flow':
             mf_spec=settings.fixed_fuel_kg_h/3600/(N_CYL*rpm/120)
             reference=simulate_cycle(settings,0,rpm,m_f_fixed=mf_spec)
             scenario=simulate_cycle(settings,settings.b_pct,rpm,m_f_fixed=mf_spec,
-                                    recipe=settings.fuel_scheme=='ppo')
+                                    recipe=True)
         else:
             reference=simulate_cycle(settings,0,rpm)
             scenario=simulate_cycle(settings,settings.b_pct,rpm,
                                 m_f_fixed=reference['fuel_mg_cycle_cyl']/1e6 if settings.mode=='fixed_injection' else None,
-                                recipe=settings.fuel_scheme=='ppo')
+                                recipe=True)
         # Rating nameplate adalah TITIK ACUAN bukan validasi hasil fisika.
         rated_torque=full_load_torque(rpm,settings.variant)
         for output in (reference, scenario):
@@ -443,8 +610,24 @@ def run_sweep(settings: Settings) -> dict:
             output['above_rated_rpm']=rpm>profile.rated_rpm
             output['pnm_variant_verified']=False
         reference['series']='B0 REFERENSI'
-        scenario['series']=(f'PPO{settings.ppo_pct:g}+Dex{100-settings.ppo_pct-settings.b50_pct:g}+B50_{settings.b50_pct:g} SKENARIO'
-                            if settings.fuel_scheme=='ppo' else f'B{settings.b_pct:g} SKENARIO')
+        if settings.fuel_scheme=='ppo_b0':
+            scenario['series']=f'P{settings.ppo_pct:g} (PPO+B0) SKENARIO'
+        elif settings.fuel_scheme=='ppo':
+            scenario['series']=(f'PPO{settings.ppo_pct:g}+B0{100-settings.ppo_pct-settings.b50_pct:g}'
+                                f'+B50_{settings.b50_pct:g} SKENARIO')
+        else:
+            scenario['series']=f'B{settings.b_pct:g} SKENARIO'
+        if settings.scenario_fuel_override is not None:
+            scenario['series']+=' [PROPERTI MANUAL]'
+        if settings.mode=='fixed_volume_cycle':
+            for point in (reference,scenario):
+                point['requested_fuel_volume_mm3_cycle_cyl']=settings.fixed_volume_mm3_cycle_cyl
+                point['requested_fuel_l_h']=(settings.fixed_volume_mm3_cycle_cyl*1e-9*
+                    point['fuel_density_kg_m3']*N_CYL*rpm/120*3600*1000/point['fuel_density_kg_m3'])
+        else:
+            for point in (reference,scenario):
+                point['requested_fuel_volume_mm3_cycle_cyl']=None
+                point['requested_fuel_l_h']=None
         reference['focus']=rpm==settings.rpm; scenario['focus']=rpm==settings.rpm
         ref_nox=max(reference['nox_raw'],1e-30)
         ref_soot=max(reference['smoke_raw'],1e-30)
