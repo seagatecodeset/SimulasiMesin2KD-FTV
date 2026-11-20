@@ -1,78 +1,59 @@
-# Toyota 2KD-FTV Engine Simulator — Streamlit Cloud V3 (2WD / 4WD)
+# Diesel Engine Simulator V6 — Toyota 2KD-FTV + Kubota RD85
 
-**Rilis:** 16 November 2026. **Model:** termodinamika 0D satu zona dengan integrator Heun (RK2), tanpa machine learning. **Hosting:** Streamlit Community Cloud melalui GitHub, tidak memerlukan server sendiri.
+Aplikasi Streamlit Community Cloud; model **fisika 0D + torsi target**, tanpa Machine Learning dan tanpa dataset eksperimen PNM.
 
-## Profil mesin
+## Menu mesin
 
-| Parameter | 2WD awal | 4WD awal (High Version) |
-| --- | ---: | ---: |
-| Rated power | 65 kW @ 3.800 rpm | 75 kW @ 3.600 rpm |
-| Max torque | 192 Nm @ 1.200–3.000 rpm | 260 Nm @ 1.600–2.400 rpm |
-| Bore / stroke | 92 / 93,8 mm | 92 / 93,8 mm |
-| Displacement | 2.494 cm³ | 2.494 cm³ |
-| Compression ratio | 18,5:1 | 18,5:1 |
-| Max turbo PR *model* (editable) | **1,65 asumsi** | **1,80 asumsi** |
+- **Toyota 2KD-FTV**: 2WD awal (65 kW @ 3800 rpm) dan 4WD awal (75 kW @ 3600 rpm). Model ada dalam `physics.py`, berasal dari V5.
+- **Kubota RD85 DI**: satu silinder, bore × stroke 88 × 84 mm, kapasitas ~511 cc, daya maks 8,5 HP @ 2200 rpm, torsi maks 3,40 kgf·m @ 1600 rpm. Model ada dalam `rd85_physics.py`, menggunakan kerangka 0D yang sama dengan perbedaan geometri, jumlah silinder, dan envelope torsi. Informasi ini diambil dari file `Optimasi_Formulasi_PPO_RD85.html` yang disediakan pengguna. **CR=18, connecting rod=130 mm, SOI=-15°CA dan beberapa koefisien pembakaran masih ASUMSI, bukan hasil ukur.** RD85 di sini diasumsikan tanpa turbo.
 
-**Sumber parameter rating dan geometri:** Toyota, *New Features – 2KD-FTV Engine*, halaman 19:
-https://toyotamanuals.gitlab.io/pz471-zx006-ca/htmlweb/ncf/ncf210e/m_nf_0018.pdf
+## Tiga jenis campuran
 
-**PENTING:** bentuk envelope torsi antar-anchor, nilai torsi 1.000 rpm, dan ekstrapolasi torsi 4WD antara 3.600–3.800 rpm merupakan **asumsi**, bukan data pabrikan. Turbo PR maksimal, injeksi pilot, temperatur, LHV, pembakaran dan kerugian mesin adalah pendekatan ilustratif yang memerlukan kalibrasi. Varian 2WD/4WD di sini merepresentasikan konfigurasi/rating mesin menurut dokumen Toyota; bukan efek mekanis drivetrain 2WD/4WD.
+1. **B0 (Pertadex) + B100 (biodiesel)**, B0–B100.
+2. **B0 (Pertadex) + PPO**, P0–P100.
+3. **B0 (Pertadex) + PPO + B50 (premix)**. Tiga slider B0/PPO/B50 berjumlah **tepat 100% volume**, termasuk saat salah satunya digeser ke 0% atau 100%. Saat salah satu slider digeser, dua yang lain mengikuti **proporsi sebelum perubahan**. Contoh awal **30% B0 + 50% PPO + 20% B50**.
 
-## Fitur V3
+B50 pada pilihan ketiga adalah **produk premix 50% biodiesel**, bukan B100. Karena B50 menjadi salah satu *komponen dasar*, seluruh sifatnya bisa diedit sebagai bahan bakar tersendiri.
 
-- **Engine Variant** pada sidebar, beralih langsung antara profil **2WD** dan **4WD**.
-- Mengubah varian otomatis mengubah titik rating, plateau torque, BMEP target, turbo PR default, label grafik, flag di atas rated RPM, dan metadata ekspor.
-- Grafik overlay envelope nominal per varian plus perbandingan 2WD dan 4WD (terpisah dari kurva simulasi aktual).
-- **Empat mode V2 dipertahankan**: `fixed_torque`, `fixed_injection`, `fixed_mass_cycle`, `fixed_fuel_flow`.
-- Simulasi B0–B100 dan PPO-M/Dex/B50 *ilustratif*, tabel properti bahan bakar, tekanan silinder, temperatur gas, CA50, BTE/BSFC model, indeks NOx/smoke relatif, riwayat per sesi dan ekspor CSV.
-- Dataset eksperimen PNM B0/B50 untuk 1.250–2.250 rpm ditampilkan sebagai **referensi deskriptif**. Varian mesin yang diuji belum dapat dipastikan; karena itu PNM **tidak otomatis berlaku** bagi 2WD atau 4WD. Kondisi beban pun belum terverifikasi.
-- Kolom **fuel consumption PNM tetap dikecualikan**, sehingga angka konsumsi, BSFC dan BTE dalam dashboard berasal dari model, bukan data tersebut.
+Sifat campuran: densitas = campuran berdasarkan volume (asumsi volume aditif); LHV dan C/H/O = pembobotan berdasarkan fraksi massa; viskositas = VBN blending; CN = proxy fraksi volume; flash point = perkiraan, **bukan verifikasi keamanan campuran**. Seluruh persentase yang tampil adalah **volume**, bukan massa.
 
-## Struktur berkas
+## Menu dan keluaran
 
-```text
-streamlit_app.py              dashboard Cloud (entry point)
-physics.py                    engine model 0D + EngineProfile 2wd/4wd
-requirements.txt              dependensi
-.streamlit/config.toml        konfigurasi tema
-.gitignore                    pengecualian file sementara
-data/pnm_b0_b50.csv           data PNM tanpa fuel consumption
-tests/test_physics.py         tujuh uji dasar V2
-tests/test_modes_v2.py        lima uji mode V2
-tests/test_variants_v3.py     tujuh uji profil/fitur V3
-tests/test_pnm_fallback.py    pengujian CSV cadangan
-tests/smoke_ui_stub.py       uji smoke UI berbasis objek pengganti, tanpa instalasi Streamlit
-PANDUAN_UPDATE_V3.md          cara update GitHub → Streamlit
-PANDUAN_DEPLOY_CLOUD.md       cara deploy baru
-verifikasi_paket.py           cek paket/solver lokal
-```
+- **Ringkasan**: torsi, daya, BMEP, BTE, BSFC, laju bahan bakar, indeks emisi.
+- **Performa**: kurva RPM, konsumsi kg/jam dan L/jam, energi kimia.
+- **Indikator emisi**: NOx dan smoke **indeks relatif B0=100**, CO₂ ideal neraca karbon; bukan emisi aktual ppm, HSU atau PM.
+- **Pembakaran 0D**: kurva tekanan, temperatur, fraksi terbakar, ignition delay, CA50.
+- **Fuel properties**: tabel properti, grafik komposisi, sumber/asumsi.
+- **Ekspor & metode**: CSV grafik, riwayat sesi, fuel properties.
 
-## Pembaruan cepat aplikasi online
+## Batasan penting
 
-1. Cadangkan `physics.py` dan `streamlit_app.py` versi sebelumnya dari repository GitHub Anda.
-2. Ganti **kedua berkas** tersebut dengan versi V3 di root repository GitHub, jangan hanya salah satunya.
-3. Disarankan unggah pula `tests/test_variants_v3.py`, `README.md`, dan `PANDUAN_UPDATE_V3.md`.
-4. **Commit changes** pada branch yang digunakan Streamlit Cloud (biasanya `main`).
-5. Buka aplikasi Streamlit yang sudah online dan pilih `Engine Variant` di sidebar. Jika masih menampilkan V2, gunakan `Manage app → Reboot app` dan pastikan commit telah selesai.
+- **Mode kendali satu-satunya adalah Torsi Target per RPM**. Daya/torsi B0 dan campuran dapat hampir sama akibat target yang sama. Ini bukan prediksi independen daya maksimum saat bahan bakar diganti.
+- **Tidak ada pembacaan atau tampilan data PNM**. Tidak ada dependensi `data/pnm_b0_b50.csv`.
+- File HTML RD85 memuat *test bed virtual*, data sintetis, regresi Scheffé, dan optimasi. **Bagian-bagian sintetis dan regresi tersebut tidak dipakai sebagai hasil eksperimen maupun model prediksi aplikasi ini.** Hanya data geometri/parameter acuan dan pendekatan analisis pembakaran yang dirujuk.
+- Torsi antar titik rating, thermodynamic coefficients, boost surrogate Toyota, dan emisi adalah estimasi; belum kalibrasi/perbandingan dengan data tekanan silinder aktual.
+- PPO P100 adalah **skenario matematis**, bukan rekomendasi operasional. Perlu pemeriksaan kompatibilitas mesin, kualitas bahan bakar, stabilitas, flash point terukur, dan keselamatan.
 
-Tidak perlu aplikasi baru, token, Docker, PHP, atau server institusi.
-
-## Tes sebelum diunggah (opsional)
-
-```bash
-python verifikasi_paket.py
-python -m unittest discover -s tests -v
-```
-
-Instal dependensi Streamlit jika ingin menguji UI lokal:
+## Jalankan lokal (opsional)
 
 ```bash
 python -m pip install -r requirements.txt
 python -m streamlit run streamlit_app.py
 ```
 
-## Batasan ilmiah
+## Menjalankan pengujian otomatis
 
-Hasil mode target torsi mengikuti envelope yang **dimasukkan** dari rating pabrikan. Mencapai tepat 65 kW @ 3.800 atau 75 kW @ 3.600 pada mode ini bukan pembuktian prediksi fisika independen. Model fisika tidak memiliki seluruh peta ECU, rail injection, turbocharger, EGR, intercooler dan aftertreatment yang divalidasi pada kedua varian. Hasil tidak untuk sertifikasi emisi, diagnosis keselamatan, atau perancangan injeksi nyata. Grafik NOx/smoke hanya indeks relatif; bukan data terukur dalam ppm/%HSU.
+```bash
+python -m unittest discover -s tests -p 'test_v6.py' -v
+```
 
-**Sumber studi sifat bahan bakar** merupakan penelitian lain pada tipe 2KD-FTV dan harus diperlakukan sebagai data referensi. Nilai kalor ASTM D240 dan cetane index masih memerlukan pemeriksaan HHV/LHV dan cetane number/DCN.
+`tests/smoke_ui_stub.py` menguji pembuatan grafik dengan antarmuka Streamlit *tiruan*; bukan pengujian browser nyata.
+
+## Deploy ke Streamlit Community Cloud
+
+1. Upload **seluruh file** `streamlit_app.py`, `physics.py`, `rd85_physics.py`, `blend_controls.py`, dan `requirements.txt` ke **root** repository GitHub; jangan unggah ZIP sebagai satu file.
+2. Buka Streamlit Community Cloud, pilih repository dan entry point `streamlit_app.py`.
+3. Commit; tunggu build; bila masih menampilkan V5 pilih **Manage app → Reboot app**.
+4. Uji RD85 → campuran ternary → 30/50/20 → Run, kemudian Toyota 2WD/4WD.
+
+Acuan utama: J. B. Heywood, *Internal Combustion Engine Fundamentals*; file pengguna `Optimasi_Formulasi_PPO_RD85.html`; model Toyota versi sebelumnya.
